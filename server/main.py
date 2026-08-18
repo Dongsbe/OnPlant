@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 from random import choices, uniform
 from threading import Lock
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -20,6 +29,8 @@ from pydantic import BaseModel, Field
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 DATA_PATH = Path(os.getenv("ONPLANT_DATA", BASE_DIR / "onplant_state.json"))
+VOICE_DIR = BASE_DIR / "voice_outputs"
+VOICE_DIR.mkdir(exist_ok=True)
 
 app = FastAPI(title="OnPlant Server", version="0.5.0")
 app.add_middleware(
@@ -30,6 +41,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+app.mount("/voice_outputs", StaticFiles(directory=VOICE_DIR), name="voice_outputs")
 
 
 class UserCreate(BaseModel):
@@ -149,6 +161,12 @@ class RobotConfig(BaseModel):
     drive_enabled: bool = False
     explore_seconds: int = Field(default=50, ge=5, le=600)
     lidar_speed: int = Field(default=45, ge=0, le=100)
+    default_region: str = Field(default="진주", max_length=80)
+    daily_lux_min: int = Field(default=300, ge=0, le=20000)
+    daily_lux_max: int = Field(default=800, ge=0, le=20000)
+    search_lux_min: int = Field(default=800, ge=0, le=20000)
+    search_lux_max: int = Field(default=900, ge=0, le=20000)
+    excess_lux: int = Field(default=1100, ge=0, le=20000)
     camera_enabled: bool = True
     camera_url: str = Field(default="", max_length=300)
 
@@ -158,10 +176,33 @@ class CommandIn(BaseModel):
     value: str | int | float | bool | None = None
 
 
+class LlmChatIn(BaseModel):
+    message: str = Field(min_length=1, max_length=500)
+    username: str = Field(default="demo", max_length=32)
+
+
 class StoredCommand(CommandIn):
     id: int
     robot_id: str
     created_at: str
+
+
+class LlmChatOut(BaseModel):
+    reply: str
+    intent: str
+    listening: bool = False
+    command: StoredCommand | None = None
+    display: DisplayState | None = None
+
+
+class VoiceChatOut(BaseModel):
+    transcript: str
+    reply: str
+    intent: str
+    listening: bool = False
+    command: StoredCommand | None = None
+    display: DisplayState | None = None
+    audio_url: str | None = None
 
 
 class BoardPostIn(BaseModel):
@@ -218,12 +259,14 @@ _next_post_id = 1
 _robots: dict[str, RobotPublic] = {}
 _users: dict[str, dict[str, str]] = {}
 _configs: dict[str, RobotConfig] = {}
+_latest_readings: dict[str, StoredReading] = {}
 _history: dict[str, deque[StoredReading]] = defaultdict(lambda: deque(maxlen=500))
 _commands: dict[str, deque[StoredCommand]] = defaultdict(lambda: deque(maxlen=100))
 _board_posts: deque[BoardPost] = deque(maxlen=200)
 _lidar_latest: dict[str, StoredLidarFrame] = {}
 _move_logs: dict[str, deque[StoredMoveLog]] = defaultdict(lambda: deque(maxlen=200))
 _display_states: dict[str, DisplayState] = {}
+_llm_listen_until: dict[str, datetime] = {}
 _next_move_log_id = 1
 
 
@@ -243,12 +286,14 @@ def _robot_link_code(robot_id: str) -> str:
 def _plant_profile() -> dict[str, Any]:
     return {
         "species": "하월시아",
-        "lux_target": 900,
-        "lux_range": "800~1000 lux",
+        "lux_target": 850,
+        "daily_lux_range": "300~800 lux",
+        "lux_range": "800~900 lux",
+        "excess_lux": "1100 lux 이상",
         "temperature_range": "18~28°C",
         "humidity_range": "35~60%",
         "soil_moisture_range": "20~45%",
-        "note": "테스트베드에서는 조도를 900 lux 기준으로 맞춰 관찰합니다.",
+        "note": "",
     }
 
 
@@ -325,6 +370,7 @@ def _serialize_state() -> dict[str, Any]:
         "robots": {key: value.model_dump() for key, value in _robots.items()},
         "users": _users,
         "configs": {key: value.model_dump() for key, value in _configs.items()},
+        "latest_readings": {key: value.model_dump() for key, value in _latest_readings.items()},
         "history": {
             key: [item.model_dump() for item in values]
             for key, values in _history.items()
@@ -394,9 +440,15 @@ def _load_state() -> None:
     for key, value in data.get("configs", {}).items():
         _configs[key] = RobotConfig(**value)
 
+    _latest_readings.clear()
+    for key, value in data.get("latest_readings", {}).items():
+        _latest_readings[key] = StoredReading(**value)
+
     _history.clear()
     for key, values in data.get("history", {}).items():
         _history[key] = deque((StoredReading(**item) for item in values), maxlen=500)
+        if key not in _latest_readings and _history[key]:
+            _latest_readings[key] = _history[key][-1]
 
     _commands.clear()
     for key, values in data.get("commands", {}).items():
@@ -432,12 +484,28 @@ def _append_move_log_locked(robot_id: str, log: MoveLogIn) -> StoredMoveLog:
     return stored
 
 
+def _append_command_locked(robot_id: str, command: CommandIn) -> StoredCommand:
+    global _next_command_id
+    _ensure_robot(robot_id)
+    stored = StoredCommand(
+        id=_next_command_id,
+        robot_id=robot_id,
+        created_at=_now_iso(),
+        **command.model_dump(),
+    )
+    _next_command_id += 1
+    _commands[robot_id].append(stored)
+    return stored
+
+
 def _latest_for(robot_id: str) -> StoredReading | None:
+    if robot_id in _latest_readings:
+        return _latest_readings[robot_id]
     items = _history.get(robot_id)
     return items[-1] if items else None
 
 
-def _status_from(reading: StoredReading | None) -> dict[str, str]:
+def _status_from(reading: StoredReading | None, config: RobotConfig | None = None) -> dict[str, str]:
     if not reading:
         return {
             "level": "대기",
@@ -447,23 +515,37 @@ def _status_from(reading: StoredReading | None) -> dict[str, str]:
             "recommendation": "더미 데이터를 보내거나 라즈베리파이 센서 POST를 연결하세요.",
         }
 
+    config = config or RobotConfig()
     problems: list[str] = []
+    notices: list[str] = []
     if reading.temperature is not None and not 18 <= reading.temperature <= 28:
         problems.append("온도")
     if reading.humidity is not None and not 35 <= reading.humidity <= 60:
         problems.append("습도")
-    if reading.lux is not None and not 800 <= reading.lux <= 1000:
-        problems.append("조도")
+    if reading.lux is not None:
+        if reading.lux < config.daily_lux_min:
+            problems.append("조도 부족")
+        elif config.search_lux_min <= reading.lux <= config.search_lux_max:
+            notices.append("최적 조도 근접")
+        elif reading.lux >= config.excess_lux:
+            problems.append("조도 과다")
+        elif reading.lux > config.daily_lux_max:
+            notices.append("밝은 편")
     if reading.soil_moisture is not None and not 20 <= reading.soil_moisture <= 45:
         problems.append("토양수분")
 
     if not problems:
+        message = "식물이 안정적인 상태입니다."
+        recommendation = "현재 환경을 유지하고 주기적으로 센서 기록을 확인하세요."
+        if notices:
+            message = ", ".join(notices) + " 상태입니다."
+            recommendation = "빛 조건이 좋은 편입니다. 최적 조도 탐색 결과와 함께 관찰하세요."
         return {
             "level": "건강",
             "tone": "good",
             "emoji": "😊",
-            "message": "식물이 매우 건강한 상태입니다.",
-            "recommendation": "햇빛과 물을 적절히 받고 있어요. 지금처럼 관리해 주세요.",
+            "message": message,
+            "recommendation": recommendation,
         }
 
     label = ", ".join(problems)
@@ -474,6 +556,34 @@ def _status_from(reading: StoredReading | None) -> dict[str, str]:
         "message": f"{label} 값을 확인해야 합니다.",
         "recommendation": f"{label} 범위가 적정값에서 벗어났습니다. 환경을 조정하고 다음 데이터를 확인하세요.",
     }
+
+
+def _should_store_sensor_reading(robot_id: str, reading: StoredReading) -> bool:
+    history = _history.get(robot_id)
+    if not history:
+        return True
+
+    previous = history[-1]
+    previous_time = _parse_iso_time(previous.received_at)
+    current_time = _parse_iso_time(reading.received_at)
+    if previous_time and current_time and current_time - previous_time >= timedelta(minutes=10):
+        return True
+
+    config = _configs.get(robot_id) or RobotConfig()
+    if reading.lux is not None:
+        if reading.lux < 250 or reading.lux >= config.excess_lux:
+            return True
+        if previous.lux is not None and abs(reading.lux - previous.lux) >= 200:
+            return True
+
+    if reading.temperature is not None and (reading.temperature < 10 or reading.temperature > 35):
+        return True
+    if reading.humidity is not None and (reading.humidity < 20 or reading.humidity > 80):
+        return True
+    if reading.soil_moisture is not None and (reading.soil_moisture < 15 or reading.soil_moisture > 80):
+        return True
+
+    return False
 
 
 def _display_screen_for_robot(robot_id: str) -> str:
@@ -492,6 +602,452 @@ def _report_is_active(state: DisplayState) -> bool:
 def _display_state_for_response(robot_id: str, state: DisplayState) -> DisplayState:
     screen = "report" if _report_is_active(state) else _display_screen_for_robot(robot_id)
     return state.model_copy(update={"screen": screen})
+
+
+def _classify_robot_intent(message: str) -> tuple[str, str | None]:
+    text = message.lower().replace(" ", "")
+    if any(word in text for word in ("멈춰", "정지", "그만", "스탑", "stop")):
+        return "robot_command", "stop"
+    if any(word in text for word in ("최적조도", "조도찾", "빛찾", "밝은곳", "탐색", "search")):
+        return "robot_command", "start_light_search"
+    if any(word in text for word in ("상태", "보여줘", "리포트", "보고", "status")):
+        return "robot_command", "show_status"
+    if any(word in text for word in ("온도", "습도", "토양", "수분", "조도", "센서")):
+        return "sensor_query", None
+    return "chat", None
+
+
+def _sensor_reply(robot_id: str) -> str:
+    latest = _latest_for(robot_id)
+    if not latest:
+        return "아직 수신된 센서 데이터가 없습니다."
+    return (
+        f"현재 상태는 조도 {latest.lux if latest.lux is not None else '--'} lux, "
+        f"온도 {latest.temperature if latest.temperature is not None else '--'}도, "
+        f"습도 {latest.humidity if latest.humidity is not None else '--'}%, "
+        f"토양수분 {latest.soil_moisture if latest.soil_moisture is not None else '--'}%입니다."
+    )
+
+
+def _fallback_llm_reply(robot_id: str, message: str, intent: str, command_name: str | None) -> str:
+    if command_name == "show_status":
+        return _sensor_reply(robot_id) + " 전면 디스플레이에 상태 화면을 표시했습니다."
+    if command_name == "start_light_search":
+        return "최적 조도 탐색 명령을 보냈습니다. 로봇 명령 대기 루프에서 이 명령을 받아 탐색을 시작합니다."
+    if command_name == "stop":
+        return "정지 명령을 보냈습니다. 로봇은 현재 동작을 멈추도록 처리합니다."
+    if intent == "sensor_query":
+        return _sensor_reply(robot_id)
+    return "일상 대화는 연결 준비 중입니다. 지금은 상태 조회, 최적 조도 탐색, 정지 명령을 처리할 수 있습니다."
+
+
+def _classify_robot_intent(message: str) -> tuple[str, str | None]:
+    text = message.lower().replace(" ", "")
+
+    stop_words = ("멈춰", "정지", "그만", "스탑", "stop", "움직이지마")
+    search_words = ("최적조도", "조도찾", "빛찾", "밝은곳", "탐색", "햇빛좋은", "빛좋은", "search")
+    status_words = (
+        "상태",
+        "상처",
+        "어때",
+        "어떠",
+        "보여줘",
+        "리포트",
+        "보고",
+        "컨디션",
+        "건강",
+        "괜찮",
+        "잘크",
+        "잘살",
+        "status",
+    )
+    sensor_words = ("온도", "습도", "토양", "수분", "조도", "센서")
+    vague_robot_words = ("가줘", "움직", "찾아", "해줘", "동스비", "라즈봇", "식물")
+
+    if any(word in text for word in stop_words):
+        return "robot_command", "stop"
+    if any(word in text for word in search_words):
+        return "robot_command", "start_light_search"
+    if any(word in text for word in status_words):
+        return "robot_command", "show_status"
+    if any(word in text for word in sensor_words):
+        return "sensor_query", None
+    if any(word in text for word in vague_robot_words):
+        return "clarify", None
+    return "chat", None
+
+
+def _sensor_reply(robot_id: str) -> str:
+    latest = _latest_for(robot_id)
+    if not latest:
+        return "아직 수신된 센서 데이터가 없습니다."
+    return (
+        f"현재 상태는 조도 {latest.lux if latest.lux is not None else '--'} lux, "
+        f"온도 {latest.temperature if latest.temperature is not None else '--'}도, "
+        f"습도 {latest.humidity if latest.humidity is not None else '--'}%, "
+        f"토양수분 {latest.soil_moisture if latest.soil_moisture is not None else '--'}%입니다."
+    )
+
+
+def _fallback_llm_reply(robot_id: str, message: str, intent: str, command_name: str | None) -> str:
+    if command_name == "show_status":
+        return _sensor_reply(robot_id) + " 전면 디스플레이에 상태 화면을 표시했습니다."
+    if command_name == "start_light_search":
+        return "최적 조도 탐색 명령을 보냈습니다. 로봇 명령 대기 루프에서 이 명령을 받아 탐색을 시작합니다."
+    if command_name == "stop":
+        return "정지 명령을 보냈습니다. 로봇은 현재 동작을 멈추도록 처리합니다."
+    if intent == "sensor_query":
+        return _sensor_reply(robot_id)
+    if intent == "clarify":
+        return "상태 확인, 최적 조도 탐색, 정지 중 어떤 동작을 원하시는지 다시 말해 주세요."
+    if intent == "daily_weather":
+        region = (_configs.get(robot_id) or RobotConfig()).default_region
+        return f"{region} 기준 날씨 질문으로 이해했습니다. 실시간 기상 API는 아직 연결 전이라 정확한 현재 날씨 대신, 날씨 정보를 확인한 뒤 옷차림과 식물 위치를 조정해 주세요."
+    if intent == "daily_outfit":
+        region = (_configs.get(robot_id) or RobotConfig()).default_region
+        return f"{region} 기준으로 날씨를 확인한 뒤 옷차림을 정하는 것이 좋습니다. 쌀쌀하면 겉옷을 챙기고, 비 예보가 있으면 우산을 준비하세요."
+    if intent == "daily_time":
+        return "현재 시간은 서버 기준 " + datetime.now().strftime("%Y년 %m월 %d일 %H시 %M분") + "입니다."
+    if intent == "plant_question":
+        return "하월시아는 과습을 피하고 밝은 간접광에서 관리하는 것이 좋습니다. 흙이 충분히 말랐을 때 물을 주세요."
+    if intent == "smalltalk":
+        return "좋아요. 저는 식물 상태 확인, 최적 조도 탐색, 정지 명령을 도와줄 수 있습니다."
+    return "상태 확인, 최적 조도 탐색, 정지 명령을 처리할 수 있습니다."
+
+
+def _normalize_speech_text(message: str) -> str:
+    return message.lower().replace(" ", "").strip()
+
+
+WAKE_WORDS = ("동스비", "동스", "돈스비", "동수비", "동시비", "동쓰비", "온플랜트", "onplant", "hey동스비")
+
+
+def _looks_like_wake_word(text: str) -> bool:
+    normalized = _normalize_speech_text(text).strip(".,!?야아")
+    if normalized in WAKE_WORDS:
+        return True
+    if 2 <= len(normalized) <= 5 and ("동" in normalized or "돈" in normalized or "비" in normalized):
+        return max(SequenceMatcher(None, normalized, wake).ratio() for wake in WAKE_WORDS) >= 0.62
+    return False
+
+
+def _is_wake_word_only(message: str) -> bool:
+    return _looks_like_wake_word(message)
+
+
+def _strip_wake_word(message: str) -> str:
+    text = message.strip()
+    for wake_word in WAKE_WORDS:
+        if text.startswith(wake_word):
+            return text[len(wake_word):].strip(" ,.!?야아")
+    first_token = text.split(maxsplit=1)[0] if text else ""
+    if first_token and _looks_like_wake_word(first_token):
+        return text[len(first_token):].strip(" ,.!?야아")
+    first_three = text[:3]
+    if first_three and _looks_like_wake_word(first_three):
+        return text[3:].strip(" ,.!?야아")
+    return text
+
+
+def _classify_daily_chat(message: str) -> str:
+    text = message.lower().replace(" ", "")
+    if any(word in text for word in ("날씨", "비와", "비오", "기온", "춥", "덥")):
+        return "daily_weather"
+    if any(word in text for word in ("뭐입", "옷", "겉옷", "반팔", "긴팔", "우산")):
+        return "daily_outfit"
+    if any(word in text for word in ("몇시", "시간", "며칠", "날짜", "요일")):
+        return "daily_time"
+    if any(word in text for word in ("하월시아", "다육", "식물", "물얼마", "햇빛", "잎이", "분갈이")):
+        return "plant_question"
+    if any(word in text for word in ("심심", "피곤", "힘들", "안녕", "고마", "뭐할수")):
+        return "smalltalk"
+    return "chat"
+
+
+def _chat_system_prompt(robot_id: str) -> str:
+    config = _configs.get(robot_id) or RobotConfig()
+    latest = _latest_for(robot_id)
+    sensor_context = "아직 센서 데이터가 없습니다."
+    if latest:
+        sensor_context = (
+            f"현재 센서값: 조도 {latest.lux} lux, 온도 {latest.temperature}도, "
+            f"습도 {latest.humidity}%, 토양수분 {latest.soil_moisture}%."
+        )
+    return (
+        "너는 OnPlant 반려식물 로봇 '동스비'의 짧고 자연스러운 한국어 응답 담당이다. "
+        "모터를 직접 제어한다고 말하지 말고, 실제 명령은 서버가 처리한다고 전제한다. "
+        f"기본 지역은 {config.default_region}이다. "
+        "실시간 날씨 API가 연결되어 있지 않으면 현재 날씨를 단정하지 말고, 확인 필요하다고 말한다. "
+        "답변은 1~3문장으로 짧게 한다. "
+        f"{sensor_context}"
+    )
+
+
+def _is_listening(robot_id: str) -> bool:
+    until = _llm_listen_until.get(robot_id)
+    if not until:
+        return False
+    if until <= datetime.now(timezone.utc):
+        _llm_listen_until.pop(robot_id, None)
+        return False
+    return True
+
+
+def _start_listening(robot_id: str, seconds: int = 10) -> None:
+    _llm_listen_until[robot_id] = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+
+
+def _parse_iso_time(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _is_recent(value: str | None, seconds: int = 20) -> bool:
+    parsed = _parse_iso_time(value)
+    if not parsed:
+        return False
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - parsed <= timedelta(seconds=seconds)
+
+
+def _current_robot_motion_state(robot_id: str) -> tuple[str, bool]:
+    """Return current FSM state and whether the robot should be treated as moving."""
+    lidar = _lidar_latest.get(robot_id)
+    if lidar and _is_recent(lidar.received_at):
+        state = (lidar.state or "UNKNOWN").upper()
+        action = (lidar.action or "STOP").upper()
+        return state, state not in {"IDLE", "WAIT", "STOP", "UNKNOWN"} or action not in {"STOP", "WAIT", "IDLE"}
+
+    logs = _move_logs.get(robot_id)
+    if logs:
+        latest_log = logs[-1]
+        if _is_recent(latest_log.created_at):
+            state = (latest_log.state or "UNKNOWN").upper()
+            action = (latest_log.action or "STOP").upper()
+            return state, state not in {"IDLE", "WAIT", "STOP", "UNKNOWN"} or action not in {"STOP", "WAIT", "IDLE"}
+
+    return "IDLE", False
+
+
+def _blocked_while_running_reply(state: str) -> str:
+    return (
+        f"현재 로봇이 {state} 상태로 이동 중이라 정지 명령만 받을 수 있어요. "
+        "멈추려면 '동스비 멈춰'라고 말해 주세요."
+    )
+
+
+def _nvidia_llm_reply(message: str, system_prompt: str) -> str | None:
+    api_key = os.getenv("NVIDIA_API_KEY") or os.getenv("NVIDIA_NIM_API_KEY")
+    if not api_key:
+        return None
+
+    base_url = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1").rstrip("/")
+    model = os.getenv("NVIDIA_MODEL", "google/gemma-4-31b-it")
+    max_tokens = int(os.getenv("NVIDIA_MAX_TOKENS", "16384"))
+    temperature = float(os.getenv("NVIDIA_TEMPERATURE", "1"))
+    top_p = float(os.getenv("NVIDIA_TOP_P", "0.95"))
+    enable_thinking = os.getenv("NVIDIA_ENABLE_THINKING", "true").lower() in {"1", "true", "yes", "on"}
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": message},
+        ],
+        "chat_template_kwargs": {"enable_thinking": enable_thinking},
+        "temperature": temperature,
+        "top_p": top_p,
+        "max_tokens": max_tokens,
+        "stream": False,
+    }
+    authorization = api_key if api_key.lower().startswith("bearer ") else f"Bearer {api_key}"
+    request = urllib.request.Request(
+        f"{base_url}/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": authorization,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        return data["choices"][0]["message"]["content"].strip()
+    except (KeyError, OSError, TimeoutError, urllib.error.URLError):
+        return None
+
+
+def _process_llm_chat_locked(robot_id: str, chat: LlmChatIn) -> LlmChatOut:
+    raw_message = chat.message.strip()
+    command: StoredCommand | None = None
+    display: DisplayState | None = None
+
+    _ensure_robot(robot_id)
+    motion_state, is_moving = _current_robot_motion_state(robot_id)
+    if _is_wake_word_only(raw_message):
+        _save_state()
+        return LlmChatOut(reply="", intent="nickname", listening=False)
+
+    listening = _is_listening(robot_id)
+    message = _strip_wake_word(raw_message)
+    intent, command_name = _classify_robot_intent(message)
+    if intent == "chat":
+        intent = _classify_daily_chat(message)
+
+    if listening and intent == "chat":
+        intent = "clarify"
+
+    if is_moving and command_name != "stop":
+        _llm_listen_until.pop(robot_id, None)
+        _save_state()
+        return LlmChatOut(
+            reply=_blocked_while_running_reply(motion_state),
+            intent="blocked_while_running",
+            listening=False,
+        )
+
+    if command_name:
+        command = _append_command_locked(
+            robot_id,
+            CommandIn(command=command_name, value=raw_message),
+        )
+        _llm_listen_until.pop(robot_id, None)
+        if command_name == "show_status":
+            current = _display_states.get(robot_id) or DisplayState(updated_at=_now_iso())
+            current.screen = "report"
+            current.report_until = (datetime.now(timezone.utc) + timedelta(seconds=12)).isoformat()
+            current.updated_at = _now_iso()
+            _display_states[robot_id] = current
+            display = _display_state_for_response(robot_id, current)
+
+    reply = _fallback_llm_reply(robot_id, chat.message, intent, command_name)
+    if intent in {"daily_weather", "daily_outfit", "daily_time", "plant_question", "smalltalk", "chat"}:
+        llm_reply = _nvidia_llm_reply(chat.message, _chat_system_prompt(robot_id))
+        if llm_reply:
+            reply = llm_reply
+
+    _save_state()
+    return LlmChatOut(reply=reply, intent=intent, listening=_is_listening(robot_id), command=command, display=display)
+
+
+_stt_model_cache: Any | None = None
+
+
+def _transcribe_audio(audio_path: Path) -> str:
+    global _stt_model_cache
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as exc:
+        raise RuntimeError("faster-whisper is not installed on the server PC") from exc
+
+    if _stt_model_cache is None:
+        model_name = os.getenv("ONPLANT_STT_MODEL", "base")
+        device = os.getenv("ONPLANT_STT_DEVICE", "cpu")
+        compute_type = os.getenv("ONPLANT_STT_COMPUTE_TYPE", "int8")
+        _stt_model_cache = WhisperModel(model_name, device=device, compute_type=compute_type)
+
+    segments, _info = _stt_model_cache.transcribe(str(audio_path), language="ko", vad_filter=True)
+    text = " ".join(segment.text.strip() for segment in segments).strip()
+    if not text:
+        raise RuntimeError("STT returned empty text")
+    return text
+
+
+def _make_edge_tts_audio(text: str) -> Path | None:
+    output_path = VOICE_DIR / f"tts_{uuid.uuid4().hex}.mp3"
+    edge_tts_module = shutil.which("edge-tts")
+    voice = os.getenv("ONPLANT_TTS_VOICE", "ko-KR-InJoonNeural")
+    rate = os.getenv("ONPLANT_TTS_RATE", "+0%")
+    pitch = os.getenv("ONPLANT_TTS_PITCH", "+0Hz")
+    volume = os.getenv("ONPLANT_TTS_VOLUME", "+0%")
+    command: list[str]
+
+    if edge_tts_module:
+        command = [
+            edge_tts_module,
+            "--voice",
+            voice,
+            "--rate",
+            rate,
+            "--pitch",
+            pitch,
+            "--volume",
+            volume,
+            "--text",
+            text,
+            "--write-media",
+            str(output_path),
+        ]
+    else:
+        command = [
+            sys.executable,
+            "-m",
+            "edge_tts",
+            "--voice",
+            voice,
+            "--rate",
+            rate,
+            "--pitch",
+            pitch,
+            "--volume",
+            volume,
+            "--text",
+            text,
+            "--write-media",
+            str(output_path),
+        ]
+
+    try:
+        subprocess.run(command, check=True, timeout=30)
+    except Exception:
+        return None
+    return output_path if output_path.exists() else None
+
+
+def _make_tts_audio(text: str) -> Path | None:
+    edge_audio = _make_edge_tts_audio(text)
+    if edge_audio:
+        return edge_audio
+
+    output_path = VOICE_DIR / f"tts_{uuid.uuid4().hex}.wav"
+
+    if os.name == "nt":
+        powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+        if not powershell:
+            return None
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as text_file:
+            text_file.write(text)
+            text_path = Path(text_file.name)
+        script = (
+            "Add-Type -AssemblyName System.Speech; "
+            f"$text = Get-Content -LiteralPath '{text_path}' -Raw -Encoding UTF8; "
+            "$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+            "$synth.Rate = 0; "
+            "$synth.Volume = 90; "
+            f"$synth.SetOutputToWaveFile('{output_path}'); "
+            "$synth.Speak($text); "
+            "$synth.Dispose();"
+        )
+        try:
+            subprocess.run([powershell, "-NoProfile", "-Command", script], check=True, timeout=25)
+        finally:
+            try:
+                text_path.unlink()
+            except OSError:
+                pass
+        return output_path if output_path.exists() else None
+
+    espeak = shutil.which("espeak-ng")
+    if not espeak:
+        return None
+    subprocess.run([espeak, "-v", "ko", "-w", str(output_path), text], check=True, timeout=25)
+    return output_path if output_path.exists() else None
 
 
 def _dummy_reading(robot_id: str) -> SensorReadingIn:
@@ -608,7 +1164,7 @@ def robot_summary(robot_id: str) -> dict[str, Any]:
             "robot": _robots[robot_id],
             "latest": latest,
             "config": _configs[robot_id],
-            "status": _status_from(latest),
+            "status": _status_from(latest, _configs[robot_id]),
             "history_count": len(_history.get(robot_id, [])),
             "command_count": len(_commands.get(robot_id, [])),
             "plant_profile": _plant_profile(),
@@ -664,8 +1220,13 @@ def receive_sensor(reading: SensorReadingIn) -> StoredReading:
             source=reading.source,
             received_at=_now_iso(),
         )
-        _next_sensor_id += 1
-        _history[reading.robot_id].append(stored)
+        should_store = _should_store_sensor_reading(reading.robot_id, stored)
+        if should_store:
+            _next_sensor_id += 1
+            _history[reading.robot_id].append(stored)
+        elif _history.get(reading.robot_id):
+            stored = stored.model_copy(update={"id": _history[reading.robot_id][-1].id})
+        _latest_readings[reading.robot_id] = stored
         _robots[reading.robot_id].last_seen = stored.received_at
         _save_state()
         return stored
@@ -711,18 +1272,8 @@ def update_robot_config(robot_id: str, config: RobotConfig) -> RobotConfig:
 
 @app.post("/api/robots/{robot_id}/commands", response_model=StoredCommand)
 def create_robot_command(robot_id: str, command: CommandIn) -> StoredCommand:
-    global _next_command_id
-
     with _lock:
-        _ensure_robot(robot_id)
-        stored = StoredCommand(
-            id=_next_command_id,
-            robot_id=robot_id,
-            created_at=_now_iso(),
-            **command.model_dump(),
-        )
-        _next_command_id += 1
-        _commands[robot_id].append(stored)
+        stored = _append_command_locked(robot_id, command)
         _save_state()
         return stored
 
@@ -732,6 +1283,57 @@ def list_robot_commands(robot_id: str, limit: int = 30) -> list[StoredCommand]:
     limit = max(1, min(limit, 100))
     with _lock:
         return list(_commands.get(robot_id, []))[-limit:]
+
+
+@app.post("/api/robots/{robot_id}/llm/chat", response_model=LlmChatOut)
+def llm_chat(robot_id: str, chat: LlmChatIn) -> LlmChatOut:
+    with _lock:
+        return _process_llm_chat_locked(robot_id, chat)
+
+
+@app.post("/api/robots/{robot_id}/voice/chat", response_model=VoiceChatOut)
+async def voice_chat(
+    robot_id: str,
+    audio: UploadFile = File(...),
+    username: str = Form(default="demo"),
+) -> VoiceChatOut:
+    suffix = Path(audio.filename or "voice.wav").suffix or ".wav"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_audio:
+        shutil.copyfileobj(audio.file, temp_audio)
+        audio_path = Path(temp_audio.name)
+
+    try:
+        transcript = await asyncio.to_thread(_transcribe_audio, audio_path)
+    except Exception as exc:
+        if "STT returned empty text" in str(exc):
+            return VoiceChatOut(transcript="", reply="", intent="no_speech", listening=False)
+        raise HTTPException(status_code=500, detail=f"STT failed: {exc}") from exc
+    finally:
+        try:
+            audio_path.unlink()
+        except OSError:
+            pass
+
+    with _lock:
+        chat_result = _process_llm_chat_locked(robot_id, LlmChatIn(message=transcript, username=username))
+
+    audio_url = None
+    try:
+        tts_path = await asyncio.to_thread(_make_tts_audio, chat_result.reply) if chat_result.reply else None
+        if tts_path:
+            audio_url = f"/voice_outputs/{tts_path.name}"
+    except Exception as exc:
+        print("TTS ERROR", exc)
+
+    return VoiceChatOut(
+        transcript=transcript,
+        reply=chat_result.reply,
+        intent=chat_result.intent,
+        listening=chat_result.listening,
+        command=chat_result.command,
+        display=chat_result.display,
+        audio_url=audio_url,
+    )
 
 
 @app.get("/api/board", response_model=list[BoardPost])
