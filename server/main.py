@@ -1070,6 +1070,11 @@ def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
 
 
+@app.get("/kiosk")
+def kiosk_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html")
+
+
 @app.get("/display")
 def display_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "display.html")

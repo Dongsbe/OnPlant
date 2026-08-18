@@ -1,8 +1,12 @@
 const state = {
   user: null,
   robotId: null,
-  view: sessionStorage.getItem("onplant_view") || "dashboard",
+  view: window.location.pathname === "/kiosk" ? "kiosk" : (sessionStorage.getItem("onplant_view") || "dashboard"),
+  kioskRoute: window.location.pathname === "/kiosk",
   latestSummary: null,
+  latestLidar: null,
+  latestCommands: [],
+  latestMoveLogs: [],
   boardCategory: "전체",
   boardPosts: [],
   loginMode: "login",
@@ -14,15 +18,17 @@ const pageText = {
   dashboard: ["메인 대시보드", "식물의 현재 상태를 한눈에 확인합니다."],
   live: ["실시간 화면", "카메라와 LiDAR 실시간 맵을 확인합니다."],
   history: ["센서 기록", "센서 변화 추이를 확인합니다."],
-  move: ["이동 로그", "FSM 주행 로그와 최적 조도 복귀 흐름을 확인합니다."],
+  move: ["실행 로그", "입력 명령과 FSM 상태 변화를 시간순으로 확인합니다."],
   control: ["제어/설정", "로봇과 디스플레이 동작 설정을 저장합니다."],
   board: ["관리 게시판", "목차 목록에서 게시글을 읽어 확인합니다."],
   admin: ["계정/로봇 설정", "관리자 전용 계정 연동 화면입니다."],
+  kiosk: ["키오스크", "실행 상태와 LiDAR 맵을 세로 화면에 표시합니다."],
 };
 
 const $ = (id) => document.getElementById(id);
 const fmt = (value, digits = 1) => value === null || value === undefined ? "--" : Number(value).toFixed(digits);
 const isAdmin = () => state.user?.role === "admin";
+if (state.kioskRoute) document.body.classList.add("kiosk-route");
 
 function escapeHtml(value) {
   return String(value)
@@ -54,8 +60,8 @@ function showApp(user) {
   $("loginScreen").classList.add("hidden");
   $("appRoot").classList.remove("hidden");
   document.querySelectorAll(".admin-only").forEach((node) => node.classList.toggle("hidden", !isAdmin()));
-  document.querySelectorAll("#mainNav .nav-item:not(.admin-only)").forEach((node) => node.classList.toggle("hidden", isAdmin()));
-  setView(isAdmin() ? "admin" : state.view);
+  if (!isAdmin() && state.view === "kiosk") state.view = "dashboard";
+  setView(state.kioskRoute && isAdmin() ? "kiosk" : state.view);
 }
 
 function showLogin() {
@@ -101,18 +107,18 @@ async function submitLogin() {
 }
 
 function setView(view) {
-  if (isAdmin() && view !== "admin") view = "admin";
+  if (view === "kiosk" && !isAdmin()) view = "dashboard";
   state.view = view;
   sessionStorage.setItem("onplant_view", view);
   document.querySelectorAll(".nav-item").forEach((button) => button.classList.toggle("active", button.dataset.view === view));
   document.querySelectorAll(".view").forEach((section) => section.classList.toggle("active", section.id === `view-${view}`));
-  $("pageTitle").textContent = pageText[view][0];
-  $("pageSub").textContent = pageText[view][1];
+  $("pageTitle").textContent = pageText[view]?.[0] || "OnPlant";
+  $("pageSub").textContent = pageText[view]?.[1] || "";
   refreshAll();
 }
 
 async function refreshSummary() {
-  if (!state.robotId || isAdmin()) return;
+  if (!state.robotId) return;
   const summary = await api(`/api/robots/${encodeURIComponent(state.robotId)}/summary`);
   state.latestSummary = summary;
   const { latest, status, config, robot } = summary;
@@ -150,6 +156,7 @@ async function refreshSummary() {
   $("searchLuxMax").value = config.search_lux_max ?? 900;
   $("excessLux").value = config.excess_lux ?? 1100;
   renderCamera(summary.display?.camera_visible);
+  renderKiosk();
 }
 
 function renderPlantAvatar(avatar) {
@@ -217,8 +224,7 @@ function drawChart(rows) {
   ctx.stroke();
 }
 
-function drawLidar(frame) {
-  const canvas = $("lidarCanvas");
+function drawLidarOnCanvas(canvas, frame) {
   if (!canvas) return;
   const ctx = canvas.getContext("2d");
   const width = canvas.width;
@@ -276,6 +282,14 @@ function drawLidar(frame) {
   }
 }
 
+function drawLidar(frame) {
+  drawLidarOnCanvas($("lidarCanvas"), frame);
+}
+
+function drawKioskLidar(frame) {
+  drawLidarOnCanvas($("kioskLidarCanvas"), frame);
+}
+
 function phaseName(frame) {
   if (!frame) return "WAIT";
   if (frame.state === "EXPLORE") return "EXPLORE";
@@ -311,42 +325,106 @@ function renderLidarPhase(frame) {
 }
 
 async function refreshLidar() {
-  if (!state.robotId || state.view !== "live") return;
+  if (!state.robotId || !["live", "kiosk"].includes(state.view)) return;
   try {
     const frame = await api(`/api/robots/${encodeURIComponent(state.robotId)}/lidar`);
+    state.latestLidar = frame;
     if (!frame) {
-      $("lidarState").textContent = "WAIT";
-      $("lidarUpdated").textContent = "--";
+      if ($("lidarState")) $("lidarState").textContent = "WAIT";
+      if ($("lidarUpdated")) $("lidarUpdated").textContent = "--";
       renderLidarPhase(null);
       drawLidar(null);
+      drawKioskLidar(null);
+      renderKiosk();
       return;
     }
     const flags = frame.emergency ? "EMERGENCY" : frame.danger ? "DANGER" : frame.front_blocked ? "BLOCKED" : "CLEAR";
-    $("lidarState").textContent = `${frame.state} / ${frame.action} / ${flags} / ${frame.points.length}pts`;
-    $("lidarUpdated").textContent = new Date(frame.received_at).toLocaleTimeString();
+    if ($("lidarState")) $("lidarState").textContent = `${frame.state} / ${frame.action} / ${flags} / ${frame.points.length}pts`;
+    if ($("lidarUpdated")) $("lidarUpdated").textContent = new Date(frame.received_at).toLocaleTimeString();
     renderLidarPhase(frame);
     drawLidar(frame);
+    drawKioskLidar(frame);
+    renderKiosk();
   } catch {
-    $("lidarState").textContent = "OFFLINE";
-    $("lidarUpdated").textContent = "--";
+    if ($("lidarState")) $("lidarState").textContent = "OFFLINE";
+    if ($("lidarUpdated")) $("lidarUpdated").textContent = "--";
     renderLidarPhase(null);
   }
 }
 
+function commandLabel(command) {
+  if (command === "start_light_search") return "최적 조도 탐색";
+  if (command === "stop") return "정지";
+  if (String(command || "").startsWith("remote-")) return "리모컨 입력";
+  return command || "명령";
+}
+
+function buildExecutionEvents(limit = 80) {
+  const commands = (state.latestCommands || []).map((item) => ({
+    kind: "input",
+    title: `INPUT: ${commandLabel(item.command)}`,
+    body: item.value || item.command || "-",
+    meta: new Date(item.created_at).toLocaleString(),
+    time: new Date(item.created_at).getTime(),
+  }));
+  const logs = (state.latestMoveLogs || []).map((item) => ({
+    kind: "fsm",
+    title: `FSM: ${item.state || "IDLE"} / ${item.action || "STOP"}`,
+    body: item.message || "-",
+    meta: `목표 ${fmt(item.target_lux, 0)} lux / 현재 ${fmt(item.current_lux, 0)} lux / ${new Date(item.created_at).toLocaleString()}`,
+    time: new Date(item.created_at).getTime(),
+  }));
+  return [...commands, ...logs].sort((a, b) => b.time - a.time).slice(0, limit);
+}
+
 async function refreshMoveLogs() {
-  if (state.view !== "move") return;
-  const logs = await api(`/api/robots/${encodeURIComponent(state.robotId)}/move-logs?limit=100`);
-  $("moveRows").innerHTML = logs.slice().reverse().map((item) => (
-    `<div class="log-item"><strong>${escapeHtml(item.state)} / ${escapeHtml(item.action)}</strong><div>${escapeHtml(item.message || "-")}</div><div class="meta">목표 ${fmt(item.target_lux, 0)} lux / 현재 ${fmt(item.current_lux, 0)} lux / ${new Date(item.created_at).toLocaleString()}</div></div>`
-  )).join("") || `<div class="muted">이동 로그가 없습니다.</div>`;
+  if (!["move", "kiosk"].includes(state.view)) return;
+  const [logs, commands] = await Promise.all([
+    api(`/api/robots/${encodeURIComponent(state.robotId)}/move-logs?limit=100`),
+    api(`/api/robots/${encodeURIComponent(state.robotId)}/commands?limit=80`),
+  ]);
+  state.latestMoveLogs = logs;
+  state.latestCommands = commands;
+  const events = buildExecutionEvents(100);
+  if ($("moveRows")) {
+    $("moveRows").innerHTML = events.map((item) => (
+      `<div class="log-item ${item.kind}"><strong>${escapeHtml(item.title)}</strong><div>${escapeHtml(item.body)}</div><div class="meta">${escapeHtml(item.meta)}</div></div>`
+    )).join("") || `<div class="muted">실행 로그가 없습니다.</div>`;
+  }
+  renderKiosk();
 }
 
 async function refreshCommands() {
-  if (state.view !== "control") return;
+  if (!["control", "kiosk"].includes(state.view)) return;
   const commands = await api(`/api/robots/${encodeURIComponent(state.robotId)}/commands?limit=30`);
+  state.latestCommands = commands;
+  if (state.view === "kiosk") {
+    renderKiosk();
+    return;
+  }
   $("commandRows").innerHTML = commands.slice().reverse().map((item) => (
     `<div class="log-item"><strong>${escapeHtml(item.command)}</strong><div>값: ${escapeHtml(item.value ?? "-")}</div><div class="meta">${new Date(item.created_at).toLocaleString()}</div></div>`
   )).join("") || `<div class="muted">등록된 명령이 없습니다.</div>`;
+}
+
+function renderKiosk() {
+  if (!$("kioskState")) return;
+  const frame = state.latestLidar;
+  const summary = state.latestSummary;
+  const latestCommand = (state.latestCommands || [])[state.latestCommands.length - 1];
+  const flags = frame?.emergency ? "비상" : frame?.danger ? "위험" : frame?.front_blocked ? "전방 장애물" : "정상";
+  $("kioskState").textContent = frame?.state || "IDLE";
+  $("kioskAction").textContent = frame?.action || "STOP";
+  $("kioskInput").textContent = latestCommand ? `${commandLabel(latestCommand.command)}: ${latestCommand.value || "-"}` : "대기 중";
+  $("kioskLux").textContent = frame?.current_lux !== undefined && frame?.current_lux !== null
+    ? `${fmt(frame.current_lux, 0)} lx`
+    : summary?.latest ? `${fmt(summary.latest.lux, 0)} lx` : "--";
+  $("kioskObstacle").textContent = `${flags}${frame?.points ? ` / ${frame.points.length} pts` : ""}`;
+  $("kioskUpdated").textContent = frame?.received_at ? new Date(frame.received_at).toLocaleTimeString() : "대기";
+  const events = buildExecutionEvents(8);
+  $("kioskLogRows").innerHTML = events.map((item) => (
+    `<div class="kiosk-log-item ${item.kind}"><strong>${escapeHtml(item.title)}</strong><span>${escapeHtml(item.body)}</span><em>${escapeHtml(item.meta)}</em></div>`
+  )).join("") || `<div class="muted">입력 대기 상태입니다.</div>`;
 }
 
 async function refreshBoard() {

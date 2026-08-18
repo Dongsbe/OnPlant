@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>On-Plant</title>
-  <link rel="stylesheet" href="/static/styles.css?v=web11">
+  <link rel="stylesheet" href="/static/styles.css?v=web12">
 </head>
 <body>
   <section class="login-screen" id="loginScreen">
@@ -29,9 +29,10 @@
         <button class="nav-item active" data-view="dashboard"><span class="nav-icon">🏠</span><span class="nav-label">대시보드</span></button>
         <button class="nav-item" data-view="live"><span class="nav-icon">📡</span><span class="nav-label">실시간 화면</span></button>
         <button class="nav-item" data-view="history"><span class="nav-icon">📈</span><span class="nav-label">센서 기록</span></button>
-        <button class="nav-item" data-view="move"><span class="nav-icon">🧭</span><span class="nav-label">이동 로그</span></button>
+        <button class="nav-item" data-view="move"><span class="nav-icon">🧭</span><span class="nav-label">실행 로그</span></button>
         <button class="nav-item" data-view="control"><span class="nav-icon">🎛</span><span class="nav-label">제어/설정</span></button>
         <button class="nav-item" data-view="board"><span class="nav-icon">💬</span><span class="nav-label">관리 게시판</span></button>
+        <button class="nav-item admin-only hidden" data-view="kiosk"><span class="nav-icon">🖥</span><span class="nav-label">키오스크</span></button>
         <button class="nav-item admin-only hidden" data-view="admin"><span class="nav-icon">🔗</span><span class="nav-label">계정/로봇</span></button>
       </nav>
       <div class="sidebar-foot"><div class="tiny-label">로그인 계정</div><strong id="currentUser">--</strong><button id="logoutButton" style="width:100%; margin-top:10px;">로그아웃</button></div>
@@ -60,7 +61,7 @@
 
       <section class="view" id="view-history"><div class="panel"><div class="section-head"><h2>센서 기록</h2><button id="clearHistory">기록 삭제</button></div><canvas id="historyChart" width="1100" height="260"></canvas><div class="table-wrap"><table><thead><tr><th>기록 번호</th><th>시간</th><th>조도</th><th>온도</th><th>습도</th><th>토양수분</th></tr></thead><tbody id="historyRows"></tbody></table></div></div></section>
 
-      <section class="view" id="view-move"><div class="panel"><div class="section-head"><h2>이동 로그</h2><span class="muted">FSM 상태와 최적 조도 복귀 과정을 기록합니다.</span></div><div id="moveRows" class="log-list move-list"></div></div></section>
+      <section class="view" id="view-move"><div class="panel"><div class="section-head"><h2>실행 로그</h2><span class="muted">입력 명령과 FSM 상태 변화를 시간순으로 확인합니다.</span></div><div id="moveRows" class="log-list move-list"></div></div></section>
 
       <section class="view" id="view-control"><div class="control-grid">
         <article class="panel"><h2>로봇 설정</h2><div class="form-grid"><label>스피커 음량<input id="speakerVolume" type="range" min="0" max="100"></label><label>화면 밝기<input id="displayBrightness" type="range" min="0" max="100"></label><label>탐색 시간(초)<input id="exploreSeconds" type="number" min="5" max="600"></label><label>기본 지역<input id="defaultRegion" maxlength="80" value="진주"></label><label>일상 조도 최소<input id="dailyLuxMin" type="number" min="0" max="20000"></label><label>일상 조도 최대<input id="dailyLuxMax" type="number" min="0" max="20000"></label><label>최적 탐색 조도 최소<input id="searchLuxMin" type="number" min="0" max="20000"></label><label>최적 탐색 조도 최대<input id="searchLuxMax" type="number" min="0" max="20000"></label><label>조도 과다 기준<input id="excessLux" type="number" min="0" max="20000"></label></div><button class="primary" id="saveConfig">설정 저장</button></article>
@@ -75,11 +76,31 @@
       </div></section>
 
       <section class="view" id="view-admin"><div class="admin-grid"><article class="panel"><h2>계정 목록</h2><div id="adminUsers" class="log-list"></div></article><article class="panel"><h2>로봇 연동</h2><div class="form-grid single"><label>사용자 아이디<input id="linkUsername" placeholder="demo"></label><label>로봇 고유코드<input id="linkCode" placeholder="OP-0000-0000"></label><label>또는 로봇 ID<input id="linkRobotId" placeholder="raspbot-a"></label></div><button class="primary" id="linkRobotButton">연동 변경</button><p class="profile-note">라즈봇이 부팅 시 고유코드를 보내면 관리자가 해당 코드를 계정에 연결하는 흐름입니다.</p></article></div></section>
+
+      <section class="view" id="view-kiosk">
+        <div class="kiosk-shell">
+          <article class="panel kiosk-log-panel">
+            <div class="section-head"><h2>실행 상태</h2><span class="pill" id="kioskUpdated">대기</span></div>
+            <div class="kiosk-status-grid">
+              <div><span class="tiny-label">FSM</span><strong id="kioskState">IDLE</strong></div>
+              <div><span class="tiny-label">입력</span><strong id="kioskInput">대기 중</strong></div>
+              <div><span class="tiny-label">동작</span><strong id="kioskAction">STOP</strong></div>
+              <div><span class="tiny-label">조도</span><strong id="kioskLux">--</strong></div>
+            </div>
+            <div id="kioskLogRows" class="kiosk-log-list"></div>
+          </article>
+          <article class="panel kiosk-map-panel">
+            <div class="section-head"><h2>LiDAR 실시간 맵</h2><span class="muted" id="kioskObstacle">장애물 대기</span></div>
+            <canvas id="kioskLidarCanvas" width="720" height="760"></canvas>
+            <div class="lidar-legend"><span><i class="dot robot"></i>로봇</span><span><i class="dot point"></i>감지점</span><span><i class="dot danger"></i>전방 위험</span></div>
+          </article>
+        </div>
+      </section>
     </main>
   </div>
 
   <div class="modal-backdrop hidden" id="profileModal"><div class="modal"><div class="section-head"><h2>프로필 편집</h2><button id="profileCancel">닫기</button></div><div class="profile-edit"><div class="profile-preview" id="profilePreview"></div><div class="profile-fields"><label>식물 이름<input id="profilePlantName" maxlength="64"></label><label>프로필 사진<input id="profileImage" type="file" accept="image/*"></label><div class="editor-actions"><button class="primary" id="profileSave">저장</button><button id="profileImageClear">사진 제거</button></div></div></div></div></div>
   <div class="toast" id="toast">저장되었습니다.</div>
-  <script src="/static/app.js?v=web11"></script>
+  <script src="/static/app.js?v=web12"></script>
 </body>
 </html>
