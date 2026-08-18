@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>On-Plant</title>
-  <link rel="stylesheet" href="/static/styles.css?v=web13">
+  <link rel="stylesheet" href="/static/styles.css?v=web14">
 </head>
 <body>
   <section class="login-screen" id="loginScreen">
@@ -75,12 +75,32 @@
         <article class="panel post-editor hidden" id="postEditor"><h2 id="postEditorTitle">글쓰기</h2><div class="post-form"><input id="editingPostId" type="hidden"><label>분류<select id="postCategory"><option selected>공지</option><option>자유게시판</option></select></label><label>제목<input id="postTitle" placeholder="제목"></label><label>내용<textarea id="postBody" placeholder="관리 방법, 점검 기록, 문제 해결 내용을 적어두세요."></textarea></label><div class="editor-actions"><button class="primary" id="postSubmit">저장</button><button id="postCancel">취소</button></div></div></article>
       </div></section>
 
-      <section class="view" id="view-admin"><div class="admin-grid"><article class="panel"><h2>계정 목록</h2><div id="adminUsers" class="log-list"></div></article><article class="panel"><h2>로봇 연동</h2><div class="form-grid single"><label>사용자 아이디<input id="linkUsername" placeholder="demo"></label><label>로봇 고유코드<input id="linkCode" placeholder="OP-0000-0000"></label><label>또는 로봇 ID<input id="linkRobotId" placeholder="raspbot-a"></label></div><button class="primary" id="linkRobotButton">연동 변경</button><p class="profile-note">라즈봇이 부팅 시 고유코드를 보내면 관리자가 해당 코드를 계정에 연결하는 흐름입니다.</p></article></div></section>
+      <section class="view" id="view-admin">
+        <div class="admin-grid">
+          <article class="panel">
+            <h2>계정 목록</h2>
+            <div id="adminUsers" class="log-list"></div>
+          </article>
+          <article class="panel">
+            <h2>로봇 연동</h2>
+            <div class="form-grid single">
+              <label>사용자 아이디<input id="linkUsername" placeholder="demo"></label>
+              <label>로봇 고유코드<input id="linkCode" placeholder="OP-0000-0000"></label>
+              <label>또는 로봇 ID<input id="linkRobotId" placeholder="raspbot-a"></label>
+            </div>
+            <div class="admin-actions">
+              <button class="primary" id="linkRobotButton">연동 변경</button>
+              <button id="openKioskMode">키오스크 모드 열기</button>
+            </div>
+            <p class="profile-note">라즈봇이 부팅 시 고유코드를 보내면 관리자가 해당 코드를 계정에 연결하는 흐름입니다.</p>
+          </article>
+        </div>
+      </section>
 
       <section class="view" id="view-kiosk">
         <div class="kiosk-shell">
           <article class="panel kiosk-log-panel">
-            <div class="section-head"><h2>실행 상태</h2><span class="pill" id="kioskUpdated">대기</span></div>
+            <div class="section-head"><h2>실행 상태</h2><div class="kiosk-head-actions"><span class="pill" id="kioskUpdated">대기</span><button id="enterFullscreen">전체화면</button></div></div>
             <pre id="kioskLogRows" class="kiosk-terminal">현재 상태: IDLE
 최근 입력: 대기 중
 현재 동작: STOP
@@ -103,6 +123,6 @@
 
   <div class="modal-backdrop hidden" id="profileModal"><div class="modal"><div class="section-head"><h2>프로필 편집</h2><button id="profileCancel">닫기</button></div><div class="profile-edit"><div class="profile-preview" id="profilePreview"></div><div class="profile-fields"><label>식물 이름<input id="profilePlantName" maxlength="64"></label><label>프로필 사진<input id="profileImage" type="file" accept="image/*"></label><div class="editor-actions"><button class="primary" id="profileSave">저장</button><button id="profileImageClear">사진 제거</button></div></div></div></div></div>
   <div class="toast" id="toast">저장되었습니다.</div>
-  <script src="/static/app.js?v=web13"></script>
+  <script src="/static/app.js?v=web14"></script>
 </body>
 </html>

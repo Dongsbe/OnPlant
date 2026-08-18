@@ -642,6 +642,30 @@ function closeProfileModal() {
   $("profileModal").classList.add("hidden");
 }
 
+async function enterFullscreen() {
+  const root = document.documentElement;
+  try {
+    if (document.fullscreenElement) {
+      await document.exitFullscreen();
+      $("enterFullscreen").textContent = "전체화면";
+      return;
+    }
+    if (!root.requestFullscreen) {
+      showToast("이 브라우저는 전체화면 전환을 지원하지 않습니다.");
+      return;
+    }
+    await root.requestFullscreen();
+    $("enterFullscreen").textContent = "전체화면 해제";
+  } catch (error) {
+    showToast("전체화면 전환은 버튼을 직접 눌렀을 때만 가능합니다.");
+    console.error(error);
+  }
+}
+
+function openKioskMode() {
+  window.location.href = "/kiosk";
+}
+
 async function saveProfile() {
   const next = $("profilePlantName").value.trim();
   if (!next) return showToast("식물 이름을 입력하세요.");
@@ -753,6 +777,12 @@ function bindEvents() {
   $("postDeleteButton").addEventListener("click", deletePost);
   $("clearHistory").addEventListener("click", clearHistory);
   $("linkRobotButton").addEventListener("click", linkRobot);
+  $("openKioskMode")?.addEventListener("click", openKioskMode);
+  $("enterFullscreen")?.addEventListener("click", enterFullscreen);
+  document.addEventListener("fullscreenchange", () => {
+    const button = $("enterFullscreen");
+    if (button) button.textContent = document.fullscreenElement ? "전체화면 해제" : "전체화면";
+  });
 }
 
 bindEvents();
