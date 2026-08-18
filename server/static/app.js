@@ -7,6 +7,7 @@ const state = {
   latestLidar: null,
   latestCommands: [],
   latestMoveLogs: [],
+  kioskLogClearedAt: Number(sessionStorage.getItem("onplant_kiosk_log_cleared_at") || 0),
   boardCategory: "전체",
   boardPosts: [],
   loginMode: "login",
@@ -64,15 +65,19 @@ function showApp(user) {
   if (isAdmin()) {
     setView(state.kioskRoute ? "kiosk" : "admin");
   } else {
-    if (state.view === "kiosk" || state.view === "admin") state.view = "dashboard";
-    setView(state.view);
+    setView("dashboard");
   }
 }
 
 function showLogin() {
   sessionStorage.removeItem("onplant_user");
+  sessionStorage.removeItem("onplant_view");
   state.user = null;
   state.robotId = null;
+  state.view = "dashboard";
+  document.body.classList.remove("kiosk-fullscreen");
+  document.querySelectorAll(".view").forEach((section) => section.classList.remove("active"));
+  $("view-dashboard")?.classList.add("active");
   $("appRoot").classList.add("hidden");
   $("loginScreen").classList.remove("hidden");
 }
@@ -115,6 +120,8 @@ function setView(view) {
   if (view === "kiosk" && !isAdmin()) view = "dashboard";
   if (isAdmin() && !["admin", "kiosk"].includes(view)) view = "admin";
   state.view = view;
+  if (view !== "kiosk") document.body.classList.remove("kiosk-fullscreen");
+  syncFullscreenLayout();
   sessionStorage.setItem("onplant_view", view);
   document.querySelectorAll(".nav-item").forEach((button) => button.classList.toggle("active", button.dataset.view === view));
   document.querySelectorAll(".view").forEach((section) => section.classList.toggle("active", section.id === `view-${view}`));
@@ -361,12 +368,13 @@ async function refreshLidar() {
 function commandLabel(command) {
   if (command === "start_light_search") return "최적 조도 탐색";
   if (command === "stop") return "정지";
+  if (command === "speak") return "음성 응답";
   if (String(command || "").startsWith("remote-")) return "리모컨 입력";
   return command || "명령";
 }
 
 function buildExecutionEvents(limit = 80) {
-  const commands = (state.latestCommands || []).map((item) => ({
+  const commands = (state.latestCommands || []).filter((item) => item.command !== "speak").map((item) => ({
     kind: "input",
     title: `INPUT: ${commandLabel(item.command)}`,
     body: item.value || item.command || "-",
@@ -408,7 +416,7 @@ async function refreshCommands() {
     renderKiosk();
     return;
   }
-  $("commandRows").innerHTML = commands.slice().reverse().map((item) => (
+  $("commandRows").innerHTML = commands.filter((item) => item.command !== "speak").slice().reverse().map((item) => (
     `<div class="log-item"><strong>${escapeHtml(item.command)}</strong><div>값: ${escapeHtml(item.value ?? "-")}</div><div class="meta">${new Date(item.created_at).toLocaleString()}</div></div>`
   )).join("") || `<div class="muted">등록된 명령이 없습니다.</div>`;
 }
@@ -417,7 +425,11 @@ function renderKiosk() {
   if (!$("kioskLogRows")) return;
   const frame = state.latestLidar;
   const summary = state.latestSummary;
-  const latestCommand = (state.latestCommands || [])[state.latestCommands.length - 1];
+  const visibleCommands = (state.latestCommands || []).filter((item) => {
+    const time = new Date(item.created_at).getTime();
+    return Number.isFinite(time) && time >= state.kioskLogClearedAt && item.command !== "speak";
+  });
+  const latestCommand = visibleCommands[visibleCommands.length - 1];
   const obstacleState = frame?.emergency ? "emergency" : frame?.danger ? "danger" : frame?.front_blocked ? "front_blocked" : "clear";
   const currentLux = frame?.current_lux !== undefined && frame?.current_lux !== null
     ? `${fmt(frame.current_lux, 0)} lx`
@@ -446,7 +458,9 @@ function renderKiosk() {
     `목표 좌표: ${bestCoord}`,
     `장애물 상태: ${obstacleState}`,
   ];
-  const events = buildExecutionEvents(80).map((item) => {
+  const events = buildExecutionEvents(120).filter((item) => {
+    return Number.isFinite(item.time) && item.time >= state.kioskLogClearedAt;
+  }).map((item) => {
     const time = Number.isFinite(item.time) ? new Date(item.time).toLocaleTimeString() : "--";
     return `[${time}] ${item.title} | ${item.body} | ${item.meta}`;
   });
@@ -593,9 +607,9 @@ async function sendChatCommand() {
     const result = await api(`/api/robots/${encodeURIComponent(state.robotId)}/llm/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json; charset=utf-8" },
-      body: JSON.stringify({ message, username: state.user?.username || "demo" }),
+      body: JSON.stringify({ message, username: state.user?.username || "demo", speak: true }),
     });
-    replyBox.textContent = result.reply || "명령을 처리했습니다.";
+    replyBox.textContent = result.reply ? "로봇 스피커로 응답을 보냈습니다." : "명령을 처리했습니다.";
     input.value = "";
     await refreshCommands();
     await refreshSummary();
@@ -647,7 +661,7 @@ async function enterFullscreen() {
   try {
     if (document.fullscreenElement) {
       await document.exitFullscreen();
-      $("enterFullscreen").textContent = "전체화면";
+      syncFullscreenLayout();
       return;
     }
     if (!root.requestFullscreen) {
@@ -655,11 +669,25 @@ async function enterFullscreen() {
       return;
     }
     await root.requestFullscreen();
-    $("enterFullscreen").textContent = "전체화면 해제";
+    syncFullscreenLayout();
   } catch (error) {
     showToast("전체화면 전환은 버튼을 직접 눌렀을 때만 가능합니다.");
     console.error(error);
   }
+}
+
+function syncFullscreenLayout() {
+  const active = Boolean(document.fullscreenElement && state.view === "kiosk");
+  document.body.classList.toggle("kiosk-fullscreen", active);
+  const button = $("enterFullscreen");
+  if (button) button.textContent = document.fullscreenElement ? "전체화면 해제" : "전체화면";
+}
+
+function clearKioskLog() {
+  state.kioskLogClearedAt = Date.now();
+  sessionStorage.setItem("onplant_kiosk_log_cleared_at", String(state.kioskLogClearedAt));
+  renderKiosk();
+  showToast("키오스크 로그를 초기화했습니다.");
 }
 
 function openKioskMode() {
@@ -779,10 +807,8 @@ function bindEvents() {
   $("linkRobotButton").addEventListener("click", linkRobot);
   $("openKioskMode")?.addEventListener("click", openKioskMode);
   $("enterFullscreen")?.addEventListener("click", enterFullscreen);
-  document.addEventListener("fullscreenchange", () => {
-    const button = $("enterFullscreen");
-    if (button) button.textContent = document.fullscreenElement ? "전체화면 해제" : "전체화면";
-  });
+  $("clearKioskLog")?.addEventListener("click", clearKioskLog);
+  document.addEventListener("fullscreenchange", syncFullscreenLayout);
 }
 
 bindEvents();

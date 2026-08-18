@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>OnPlant Display</title>
-  <link rel="stylesheet" href="/static/display.css?v=8">
+  <link rel="stylesheet" href="/static/display.css?v=9">
 </head>
 <body>
   <main class="tablet" aria-label="OnPlant front display">
@@ -93,9 +93,9 @@
       <div class="report-shell">
         <h1>식물 상태 리포트</h1>
         <div class="report-card">
-          <strong>현재 상태: 양호해요</strong>
-          <span>조도를 900 lux에 가깝게 맞추고 있어요</span>
-          <b>추천: 밝은 곳으로 이동하면 좋아요</b>
+          <strong id="reportTitle">현재 상태</strong>
+          <span id="reportMessage">최신 센서 데이터를 확인하고 있습니다.</span>
+          <b id="reportRecommend">현재 환경을 유지하고 주기적으로 확인하세요.</b>
         </div>
         <div class="metric-grid">
           <div><span>온도</span><strong id="dTemp">--°C</strong></div>
@@ -106,6 +106,6 @@
       </div>
     </section>
   </main>
-  <script src="/static/display.js?v=8"></script>
+  <script src="/static/display.js?v=9"></script>
 </body>
 </html>

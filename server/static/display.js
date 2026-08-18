@@ -33,10 +33,14 @@ async function refresh() {
     ]);
     show(state.screen || "idle");
     const latest = summary.latest || {};
+    const status = summary.status || {};
     setMetric("dTemp", latest.temperature, "°C", 1);
     setMetric("dHum", latest.humidity, "%");
     setMetric("dLux", latest.lux, " lux");
     setMetric("dSoil", latest.soil_moisture, "%");
+    document.getElementById("reportTitle").textContent = status.level || "현재 상태";
+    document.getElementById("reportMessage").textContent = status.message || "최신 센서 데이터를 확인하고 있습니다.";
+    document.getElementById("reportRecommend").textContent = status.recommendation || "현재 환경을 유지하고 주기적으로 확인하세요.";
   } catch {
     show("idle");
   }

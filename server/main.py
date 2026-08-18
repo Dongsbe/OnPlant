@@ -179,6 +179,7 @@ class CommandIn(BaseModel):
 class LlmChatIn(BaseModel):
     message: str = Field(min_length=1, max_length=500)
     username: str = Field(default="demo", max_length=32)
+    speak: bool = False
 
 
 class StoredCommand(CommandIn):
@@ -193,6 +194,14 @@ class LlmChatOut(BaseModel):
     listening: bool = False
     command: StoredCommand | None = None
     display: DisplayState | None = None
+
+
+class TextToSpeechIn(BaseModel):
+    text: str = Field(min_length=1, max_length=800)
+
+
+class TextToSpeechOut(BaseModel):
+    audio_url: str
 
 
 class VoiceChatOut(BaseModel):
@@ -817,19 +826,32 @@ def _is_recent(value: str | None, seconds: int = 20) -> bool:
 
 def _current_robot_motion_state(robot_id: str) -> tuple[str, bool]:
     """Return current FSM state and whether the robot should be treated as moving."""
+    latest_lidar_time = 0.0
+    latest_log_time = 0.0
+    latest_lidar_state: tuple[str, str] | None = None
+    latest_log_state: tuple[str, str] | None = None
+
     lidar = _lidar_latest.get(robot_id)
     if lidar and _is_recent(lidar.received_at):
-        state = (lidar.state or "UNKNOWN").upper()
-        action = (lidar.action or "STOP").upper()
-        return state, state not in {"IDLE", "WAIT", "STOP", "UNKNOWN"} or action not in {"STOP", "WAIT", "IDLE"}
+        parsed = _parse_iso_time(lidar.received_at)
+        latest_lidar_time = parsed.timestamp() if parsed else 0.0
+        latest_lidar_state = ((lidar.state or "UNKNOWN").upper(), (lidar.action or "STOP").upper())
 
     logs = _move_logs.get(robot_id)
     if logs:
         latest_log = logs[-1]
         if _is_recent(latest_log.created_at):
-            state = (latest_log.state or "UNKNOWN").upper()
-            action = (latest_log.action or "STOP").upper()
-            return state, state not in {"IDLE", "WAIT", "STOP", "UNKNOWN"} or action not in {"STOP", "WAIT", "IDLE"}
+            parsed = _parse_iso_time(latest_log.created_at)
+            latest_log_time = parsed.timestamp() if parsed else 0.0
+            latest_log_state = ((latest_log.state or "UNKNOWN").upper(), (latest_log.action or "STOP").upper())
+
+    if latest_log_state and latest_log_time >= latest_lidar_time:
+        state, action = latest_log_state
+        return state, state not in {"IDLE", "WAIT", "STOP", "UNKNOWN", "MAIN"} or action not in {"STOP", "WAIT", "IDLE"}
+
+    if latest_lidar_state:
+        state, action = latest_lidar_state
+        return state, state not in {"IDLE", "WAIT", "STOP", "UNKNOWN"} or action not in {"STOP", "WAIT", "IDLE"}
 
     return "IDLE", False
 
@@ -905,9 +927,12 @@ def _process_llm_chat_locked(robot_id: str, chat: LlmChatIn) -> LlmChatOut:
 
     if is_moving and command_name != "stop":
         _llm_listen_until.pop(robot_id, None)
+        reply = _blocked_while_running_reply(motion_state)
+        if chat.speak:
+            _append_command_locked(robot_id, CommandIn(command="speak", value=reply))
         _save_state()
         return LlmChatOut(
-            reply=_blocked_while_running_reply(motion_state),
+            reply=reply,
             intent="blocked_while_running",
             listening=False,
         )
@@ -931,6 +956,9 @@ def _process_llm_chat_locked(robot_id: str, chat: LlmChatIn) -> LlmChatOut:
         llm_reply = _nvidia_llm_reply(chat.message, _chat_system_prompt(robot_id))
         if llm_reply:
             reply = llm_reply
+
+    if chat.speak and reply:
+        _append_command_locked(robot_id, CommandIn(command="speak", value=reply))
 
     _save_state()
     return LlmChatOut(reply=reply, intent=intent, listening=_is_listening(robot_id), command=command, display=display)
@@ -1294,6 +1322,17 @@ def list_robot_commands(robot_id: str, limit: int = 30) -> list[StoredCommand]:
 def llm_chat(robot_id: str, chat: LlmChatIn) -> LlmChatOut:
     with _lock:
         return _process_llm_chat_locked(robot_id, chat)
+
+
+@app.post("/api/tts", response_model=TextToSpeechOut)
+async def text_to_speech(tts: TextToSpeechIn) -> TextToSpeechOut:
+    try:
+        tts_path = await asyncio.to_thread(_make_tts_audio, tts.text)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"TTS failed: {exc}") from exc
+    if not tts_path:
+        raise HTTPException(status_code=500, detail="TTS output was not created")
+    return TextToSpeechOut(audio_url=f"/voice_outputs/{tts_path.name}")
 
 
 @app.post("/api/robots/{robot_id}/voice/chat", response_model=VoiceChatOut)
