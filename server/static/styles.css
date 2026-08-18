@@ -1094,68 +1094,21 @@ label > select {
   flex-direction: column;
 }
 
-.kiosk-status-grid {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 8px;
-  margin-bottom: 10px;
-}
-
-.kiosk-status-grid > div {
-  min-height: 76px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: #fbfdfb;
-  padding: 10px;
-  display: grid;
-  align-content: center;
-  gap: 5px;
-}
-
-.kiosk-status-grid strong {
-  min-width: 0;
-  color: var(--ink);
-  font-size: 17px;
-  line-height: 1.25;
-  word-break: keep-all;
-}
-
-.kiosk-log-list {
+.kiosk-terminal {
   min-height: 0;
+  flex: 1;
   overflow: auto;
-  display: grid;
-  gap: 8px;
-  padding-right: 2px;
-}
-
-.kiosk-log-item {
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: #fbfdfb;
-  padding: 10px 12px;
-  display: grid;
-  gap: 4px;
-}
-
-.kiosk-log-item strong {
-  color: var(--green);
+  background: #101512;
+  color: #dff1dd;
+  padding: 14px 16px;
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: keep-all;
+  font-family: Consolas, "Courier New", monospace;
   font-size: 15px;
-}
-
-.kiosk-log-item.input strong {
-  color: #0b5cad;
-}
-
-.kiosk-log-item span {
-  color: var(--ink);
-  font-weight: 800;
-  line-height: 1.35;
-}
-
-.kiosk-log-item em {
-  color: var(--muted);
-  font-size: 12px;
-  font-style: normal;
+  line-height: 1.55;
   font-weight: 800;
 }
 
@@ -1192,18 +1145,14 @@ label > select {
     grid-template-rows: auto auto;
   }
 
-  .kiosk-status-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
   #kioskLidarCanvas {
     min-height: 420px;
   }
 }
 
 @media (max-width: 620px) {
-  .kiosk-status-grid {
-    grid-template-columns: 1fr;
+  .kiosk-terminal {
+    font-size: 13px;
   }
 
   #kioskLidarCanvas {

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>On-Plant</title>
-  <link rel="stylesheet" href="/static/styles.css?v=web12">
+  <link rel="stylesheet" href="/static/styles.css?v=web13">
 </head>
 <body>
   <section class="login-screen" id="loginScreen">
@@ -81,13 +81,15 @@
         <div class="kiosk-shell">
           <article class="panel kiosk-log-panel">
             <div class="section-head"><h2>실행 상태</h2><span class="pill" id="kioskUpdated">대기</span></div>
-            <div class="kiosk-status-grid">
-              <div><span class="tiny-label">FSM</span><strong id="kioskState">IDLE</strong></div>
-              <div><span class="tiny-label">입력</span><strong id="kioskInput">대기 중</strong></div>
-              <div><span class="tiny-label">동작</span><strong id="kioskAction">STOP</strong></div>
-              <div><span class="tiny-label">조도</span><strong id="kioskLux">--</strong></div>
-            </div>
-            <div id="kioskLogRows" class="kiosk-log-list"></div>
+            <pre id="kioskLogRows" class="kiosk-terminal">현재 상태: IDLE
+최근 입력: 대기 중
+현재 동작: STOP
+현재 조도: --
+목표 조도: --
+최고 조도: --
+현재 좌표: --
+목표 좌표: --
+장애물 상태: clear</pre>
           </article>
           <article class="panel kiosk-map-panel">
             <div class="section-head"><h2>LiDAR 실시간 맵</h2><span class="muted" id="kioskObstacle">장애물 대기</span></div>
@@ -101,6 +103,6 @@
 
   <div class="modal-backdrop hidden" id="profileModal"><div class="modal"><div class="section-head"><h2>프로필 편집</h2><button id="profileCancel">닫기</button></div><div class="profile-edit"><div class="profile-preview" id="profilePreview"></div><div class="profile-fields"><label>식물 이름<input id="profilePlantName" maxlength="64"></label><label>프로필 사진<input id="profileImage" type="file" accept="image/*"></label><div class="editor-actions"><button class="primary" id="profileSave">저장</button><button id="profileImageClear">사진 제거</button></div></div></div></div></div>
   <div class="toast" id="toast">저장되었습니다.</div>
-  <script src="/static/app.js?v=web12"></script>
+  <script src="/static/app.js?v=web13"></script>
 </body>
 </html>

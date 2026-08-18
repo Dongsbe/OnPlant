@@ -60,8 +60,13 @@ function showApp(user) {
   $("loginScreen").classList.add("hidden");
   $("appRoot").classList.remove("hidden");
   document.querySelectorAll(".admin-only").forEach((node) => node.classList.toggle("hidden", !isAdmin()));
-  if (!isAdmin() && state.view === "kiosk") state.view = "dashboard";
-  setView(state.kioskRoute && isAdmin() ? "kiosk" : state.view);
+  document.querySelectorAll("#mainNav .nav-item:not(.admin-only)").forEach((node) => node.classList.toggle("hidden", isAdmin()));
+  if (isAdmin()) {
+    setView(state.kioskRoute ? "kiosk" : "admin");
+  } else {
+    if (state.view === "kiosk" || state.view === "admin") state.view = "dashboard";
+    setView(state.view);
+  }
 }
 
 function showLogin() {
@@ -108,6 +113,7 @@ async function submitLogin() {
 
 function setView(view) {
   if (view === "kiosk" && !isAdmin()) view = "dashboard";
+  if (isAdmin() && !["admin", "kiosk"].includes(view)) view = "admin";
   state.view = view;
   sessionStorage.setItem("onplant_view", view);
   document.querySelectorAll(".nav-item").forEach((button) => button.classList.toggle("active", button.dataset.view === view));
@@ -408,23 +414,43 @@ async function refreshCommands() {
 }
 
 function renderKiosk() {
-  if (!$("kioskState")) return;
+  if (!$("kioskLogRows")) return;
   const frame = state.latestLidar;
   const summary = state.latestSummary;
   const latestCommand = (state.latestCommands || [])[state.latestCommands.length - 1];
-  const flags = frame?.emergency ? "비상" : frame?.danger ? "위험" : frame?.front_blocked ? "전방 장애물" : "정상";
-  $("kioskState").textContent = frame?.state || "IDLE";
-  $("kioskAction").textContent = frame?.action || "STOP";
-  $("kioskInput").textContent = latestCommand ? `${commandLabel(latestCommand.command)}: ${latestCommand.value || "-"}` : "대기 중";
-  $("kioskLux").textContent = frame?.current_lux !== undefined && frame?.current_lux !== null
+  const obstacleState = frame?.emergency ? "emergency" : frame?.danger ? "danger" : frame?.front_blocked ? "front_blocked" : "clear";
+  const currentLux = frame?.current_lux !== undefined && frame?.current_lux !== null
     ? `${fmt(frame.current_lux, 0)} lx`
     : summary?.latest ? `${fmt(summary.latest.lux, 0)} lx` : "--";
-  $("kioskObstacle").textContent = `${flags}${frame?.points ? ` / ${frame.points.length} pts` : ""}`;
+  const config = summary?.config || {};
+  const profile = summary?.plant_profile || {};
+  const targetLux = profile.lux_range || `${config.search_lux_min ?? 800}~${config.search_lux_max ?? 900} lux`;
+  const bestLux = frame?.best_lux !== undefined && frame?.best_lux !== null ? `${fmt(frame.best_lux, 0)} lx` : "--";
+  const pose = frame?.pose_x !== undefined && frame?.pose_x !== null && frame?.pose_y !== undefined && frame?.pose_y !== null
+    ? `(${fmt(frame.pose_x, 0)}, ${fmt(frame.pose_y, 0)})`
+    : "--";
+  const bestCoord = frame?.best_x !== undefined && frame?.best_x !== null && frame?.best_y !== undefined && frame?.best_y !== null
+    ? `(${fmt(frame.best_x, 0)}, ${fmt(frame.best_y, 0)})`
+    : "--";
+  const recentInput = latestCommand ? `${commandLabel(latestCommand.command)}${latestCommand.value ? ` / ${latestCommand.value}` : ""}` : "대기 중";
+  $("kioskObstacle").textContent = `${obstacleState}${frame?.points ? ` / ${frame.points.length} pts` : ""}`;
   $("kioskUpdated").textContent = frame?.received_at ? new Date(frame.received_at).toLocaleTimeString() : "대기";
-  const events = buildExecutionEvents(8);
-  $("kioskLogRows").innerHTML = events.map((item) => (
-    `<div class="kiosk-log-item ${item.kind}"><strong>${escapeHtml(item.title)}</strong><span>${escapeHtml(item.body)}</span><em>${escapeHtml(item.meta)}</em></div>`
-  )).join("") || `<div class="muted">입력 대기 상태입니다.</div>`;
+  const headerLines = [
+    `현재 상태: ${frame?.state || "IDLE"}`,
+    `최근 입력: ${recentInput}`,
+    `현재 동작: ${frame?.action || "STOP"}`,
+    `현재 조도: ${currentLux}`,
+    `목표 조도: ${targetLux}`,
+    `최고 조도: ${bestLux}`,
+    `현재 좌표: ${pose}`,
+    `목표 좌표: ${bestCoord}`,
+    `장애물 상태: ${obstacleState}`,
+  ];
+  const events = buildExecutionEvents(80).map((item) => {
+    const time = Number.isFinite(item.time) ? new Date(item.time).toLocaleTimeString() : "--";
+    return `[${time}] ${item.title} | ${item.body} | ${item.meta}`;
+  });
+  $("kioskLogRows").textContent = `${headerLines.join("\n")}\n\n--- 실행 로그 ---\n${events.join("\n") || "입력 대기 상태입니다."}`;
 }
 
 async function refreshBoard() {
