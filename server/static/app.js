@@ -1,7 +1,21 @@
+const viewRoutes = {
+  dashboard: "/dashboard",
+  live: "/live",
+  history: "/sensors",
+  move: "/logs",
+  control: "/control",
+  board: "/board",
+  admin: "/admin",
+  kiosk: "/kiosk",
+};
+
+const routeViews = Object.fromEntries(Object.entries(viewRoutes).map(([view, route]) => [route, view]));
+const requestedView = routeViews[window.location.pathname] || sessionStorage.getItem("onplant_view") || "dashboard";
+
 const state = {
   user: null,
   robotId: null,
-  view: window.location.pathname === "/kiosk" ? "kiosk" : (sessionStorage.getItem("onplant_view") || "dashboard"),
+  view: requestedView,
   kioskRoute: window.location.pathname === "/kiosk",
   latestSummary: null,
   latestLidar: null,
@@ -62,11 +76,11 @@ function showApp(user) {
   $("appRoot").classList.remove("hidden");
   document.querySelectorAll(".admin-only").forEach((node) => node.classList.toggle("hidden", !isAdmin()));
   document.querySelectorAll("#mainNav .nav-item:not(.admin-only)").forEach((node) => node.classList.toggle("hidden", isAdmin()));
-  if (isAdmin()) {
-    setView(state.kioskRoute ? "kiosk" : "admin");
-  } else {
-    setView("dashboard");
-  }
+  const requested = routeViews[window.location.pathname] || state.view;
+  const nextView = isAdmin()
+    ? (["admin", "kiosk"].includes(requested) ? requested : "admin")
+    : (["admin", "kiosk"].includes(requested) ? "dashboard" : requested);
+  setView(nextView, { replace: true });
 }
 
 function showLogin() {
@@ -80,6 +94,7 @@ function showLogin() {
   $("view-dashboard")?.classList.add("active");
   $("appRoot").classList.add("hidden");
   $("loginScreen").classList.remove("hidden");
+  window.history.replaceState({}, "", "/");
 }
 
 function setLoginMode(mode) {
@@ -116,10 +131,16 @@ async function submitLogin() {
   }
 }
 
-function setView(view) {
+function setView(view, options = {}) {
   if (view === "kiosk" && !isAdmin()) view = "dashboard";
   if (isAdmin() && !["admin", "kiosk"].includes(view)) view = "admin";
   state.view = view;
+  const route = viewRoutes[view] || "/dashboard";
+  if (options.updateUrl !== false && window.location.pathname !== route) {
+    window.history[options.replace ? "replaceState" : "pushState"]({}, "", route);
+  }
+  state.kioskRoute = route === "/kiosk";
+  document.body.classList.toggle("kiosk-route", state.kioskRoute);
   if (view !== "kiosk") document.body.classList.remove("kiosk-fullscreen");
   syncFullscreenLayout();
   sessionStorage.setItem("onplant_view", view);
@@ -130,20 +151,37 @@ function setView(view) {
   refreshAll();
 }
 
+function setConnectionState(online, lastSeen = null) {
+  const pill = $("connectionPill");
+  if (!pill) return;
+  pill.textContent = online ? "온라인" : "오프라인";
+  pill.className = `connection-pill ${online ? "online" : "offline"}`;
+  pill.title = lastSeen ? `마지막 수신: ${new Date(lastSeen).toLocaleString()}` : "수신 기록 없음";
+}
+
 async function refreshSummary() {
   if (!state.robotId) return;
-  const summary = await api(`/api/robots/${encodeURIComponent(state.robotId)}/summary`);
+  let summary;
+  try {
+    summary = await api(`/api/robots/${encodeURIComponent(state.robotId)}/summary`);
+  } catch (error) {
+    setConnectionState(false);
+    throw error;
+  }
   state.latestSummary = summary;
   const { latest, status, config, robot } = summary;
+  const online = Boolean(summary.connection?.online);
+  setConnectionState(online, summary.connection?.last_seen || robot.last_seen);
   $("plantName").textContent = robot.plant_name;
   $("robotName").textContent = `${robot.name} / ${robot.link_code || "연동 코드 없음"}`;
   renderPlantAvatar(robot.plant_avatar);
-  $("statusPill").textContent = status.level;
-  $("statusPill").className = `status-pill ${status.tone}`;
+  $("statusPill").textContent = online ? status.level : "오프라인";
+  $("statusPill").className = `status-pill ${online ? status.tone : "offline"}`;
+  $("statusPill").classList.toggle("hidden", !online);
   $("statusEmoji").textContent = status.emoji;
-  $("statusLevel").textContent = status.level;
-  $("statusMessage").textContent = status.message;
-  $("recommendation").textContent = status.recommendation;
+  $("statusLevel").textContent = online ? status.level : "오프라인";
+  $("statusMessage").textContent = online ? status.message : "라즈봇에서 최근 센서 데이터가 들어오지 않았습니다.";
+  $("recommendation").textContent = online ? status.recommendation : "라즈봇 전원과 네트워크 연결 상태를 확인하세요.";
   $("temperature").textContent = latest ? fmt(latest.temperature) : "--";
   $("humidity").textContent = latest ? fmt(latest.humidity) : "--";
   $("lux").textContent = latest ? fmt(latest.lux, 0) : "--";
@@ -160,14 +198,16 @@ async function refreshSummary() {
   $("plantNote").classList.toggle("hidden", !profile.note);
 
   $("speakerVolume").value = config.speaker_volume;
+  $("speakerVolumeValue").textContent = `${config.speaker_volume}%`;
   $("displayBrightness").value = config.display_brightness;
-  $("exploreSeconds").value = config.explore_seconds;
+  $("displayBrightnessValue").textContent = `${config.display_brightness}%`;
   $("defaultRegion").value = config.default_region || "진주";
-  $("dailyLuxMin").value = config.daily_lux_min ?? 300;
-  $("dailyLuxMax").value = config.daily_lux_max ?? 800;
-  $("searchLuxMin").value = config.search_lux_min ?? 800;
-  $("searchLuxMax").value = config.search_lux_max ?? 900;
-  $("excessLux").value = config.excess_lux ?? 1100;
+  $("adminExploreSeconds").value = config.explore_seconds;
+  $("adminDailyLuxMin").value = config.daily_lux_min ?? 300;
+  $("adminDailyLuxMax").value = config.daily_lux_max ?? 800;
+  $("adminSearchLuxMin").value = config.search_lux_min ?? 800;
+  $("adminSearchLuxMax").value = config.search_lux_max ?? 900;
+  $("adminExcessLux").value = config.excess_lux ?? 1100;
   renderCamera(summary.display?.camera_visible);
   renderKiosk();
 }
@@ -197,8 +237,8 @@ async function refreshHistory() {
   if (state.view !== "history") return;
   const rows = await api(`/api/robots/${encodeURIComponent(state.robotId)}/history?limit=80`);
   drawChart(rows);
-  $("historyRows").innerHTML = rows.slice().reverse().map((item) => (
-    `<tr><td>#${item.id}</td><td>${new Date(item.received_at).toLocaleString()}</td><td>${fmt(item.lux)}</td><td>${fmt(item.temperature)}</td><td>${fmt(item.humidity)}</td><td>${fmt(item.soil_moisture)}</td></tr>`
+  $("historyRows").innerHTML = rows.slice().reverse().map((item, index) => (
+    `<tr><td>${rows.length - index}</td><td>${new Date(item.received_at).toLocaleString()}</td><td>${fmt(item.lux)}</td><td>${fmt(item.temperature)}</td><td>${fmt(item.humidity)}</td><td>${fmt(item.soil_moisture)}</td></tr>`
   )).join("");
 }
 
@@ -305,13 +345,29 @@ function drawKioskLidar(frame) {
 
 function phaseName(frame) {
   if (!frame) return "WAIT";
-  if (frame.state === "EXPLORE") return "EXPLORE";
-  if (frame.state === "RETURN_TO_BEST") return "RETURN";
-  if (frame.state === "SEEK_LIGHT") return "SEEK";
-  if (frame.state === "AVOID") return "AVOID";
-  if (frame.state === "BACKUP") return "BACKUP";
-  if (frame.state === "IDLE") return "STOP";
+  if (frame.state === "EXPLORE") return "조도 탐색(1차)";
+  if (frame.state === "RETURN_TO_BEST") return "복귀 이동";
+  if (frame.state === "SEEK_LIGHT") return "추가 탐색(2차)";
+  if (frame.state === "AVOID") return "장애물 회피";
+  if (frame.state === "BACKUP") return "후진 탈출";
+  if (frame.state === "IDLE") return "대기";
   return frame.state || "WAIT";
+}
+
+function phaseRemaining(frame, config = {}) {
+  if (!frame) return "--";
+  if (frame.state === "EXPLORE") {
+    const total = Number(config.explore_seconds ?? 50);
+    return `${Math.max(0, Math.ceil(total - Number(frame.explore_elapsed || 0)))}초`;
+  }
+  if (frame.state === "SEEK_LIGHT") {
+    return `${Math.max(0, Math.ceil(Number(frame.seek_seconds || 0) - Number(frame.seek_elapsed || 0)))}초`;
+  }
+  if (frame.state === "RETURN_TO_BEST") {
+    const remaining = Math.max(0, Number(frame.return_total || 0) - Number(frame.return_index || 0));
+    return frame.return_total ? `${remaining}단계` : "복귀 중";
+  }
+  return "--";
 }
 
 function renderLidarPhase(frame) {
@@ -409,7 +465,7 @@ async function refreshMoveLogs() {
 }
 
 async function refreshCommands() {
-  if (!["control", "kiosk"].includes(state.view)) return;
+  if (!["admin", "kiosk"].includes(state.view)) return;
   const commands = await api(`/api/robots/${encodeURIComponent(state.robotId)}/commands?limit=30`);
   state.latestCommands = commands;
   if (state.view === "kiosk") {
@@ -422,7 +478,7 @@ async function refreshCommands() {
 }
 
 function renderKiosk() {
-  if (!$("kioskLogRows")) return;
+  if (!$("kioskLogRows") || !$("kioskStatusRows")) return;
   const frame = state.latestLidar;
   const summary = state.latestSummary;
   const visibleCommands = (state.latestCommands || []).filter((item) => {
@@ -456,6 +512,8 @@ function renderKiosk() {
     `최고 조도: ${bestLux}`,
     `현재 좌표: ${pose}`,
     `목표 좌표: ${bestCoord}`,
+    `실행 상태: ${phaseName(frame)}`,
+    `남은 시간: ${phaseRemaining(frame, config)}`,
     `장애물 상태: ${obstacleState}`,
   ];
   const events = buildExecutionEvents(120).filter((item) => {
@@ -464,7 +522,8 @@ function renderKiosk() {
     const time = Number.isFinite(item.time) ? new Date(item.time).toLocaleTimeString() : "--";
     return `[${time}] ${item.title} | ${item.body} | ${item.meta}`;
   });
-  $("kioskLogRows").textContent = `${headerLines.join("\n")}\n\n--- 실행 로그 ---\n${events.join("\n") || "입력 대기 상태입니다."}`;
+  $("kioskStatusRows").textContent = headerLines.join("\n");
+  $("kioskLogRows").textContent = events.join("\n") || "입력 대기 상태입니다.";
 }
 
 async function refreshBoard() {
@@ -554,14 +613,14 @@ async function saveConfig() {
     display_brightness: Number($("displayBrightness").value),
     display_text: previous.display_text || "OnPlant",
     drive_enabled: previous.drive_enabled ?? false,
-    explore_seconds: Number($("exploreSeconds").value),
+    explore_seconds: previous.explore_seconds ?? 50,
     lidar_speed: previous.lidar_speed ?? 45,
     default_region: $("defaultRegion").value.trim() || "진주",
-    daily_lux_min: Number($("dailyLuxMin").value),
-    daily_lux_max: Number($("dailyLuxMax").value),
-    search_lux_min: Number($("searchLuxMin").value),
-    search_lux_max: Number($("searchLuxMax").value),
-    excess_lux: Number($("excessLux").value),
+    daily_lux_min: previous.daily_lux_min ?? 300,
+    daily_lux_max: previous.daily_lux_max ?? 800,
+    search_lux_min: previous.search_lux_min ?? 800,
+    search_lux_max: previous.search_lux_max ?? 900,
+    excess_lux: previous.excess_lux ?? 1100,
     camera_enabled: true,
     camera_url: previous.camera_url || "",
   };
@@ -571,6 +630,35 @@ async function saveConfig() {
     body: JSON.stringify(payload),
   });
   showToast("설정을 저장했습니다.");
+  await refreshAll();
+}
+
+async function saveAdminConfig() {
+  if (!isAdmin()) return showToast("관리자만 탐색 설정을 변경할 수 있습니다.");
+  const previous = state.latestSummary?.config || {};
+  const dailyMin = Number($("adminDailyLuxMin").value);
+  const dailyMax = Number($("adminDailyLuxMax").value);
+  const searchMin = Number($("adminSearchLuxMin").value);
+  const searchMax = Number($("adminSearchLuxMax").value);
+  const excessLux = Number($("adminExcessLux").value);
+  if (dailyMin > dailyMax || searchMin > searchMax || excessLux < searchMax) {
+    return showToast("조도 최소·최대·과다 기준의 순서를 확인하세요.");
+  }
+  const payload = {
+    ...previous,
+    explore_seconds: Number($("adminExploreSeconds").value),
+    daily_lux_min: dailyMin,
+    daily_lux_max: dailyMax,
+    search_lux_min: searchMin,
+    search_lux_max: searchMax,
+    excess_lux: excessLux,
+  };
+  await api(`/api/robots/${encodeURIComponent(state.robotId)}/config`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  showToast("탐색 설정을 저장했습니다.");
   await refreshAll();
 }
 
@@ -587,6 +675,7 @@ async function sendRemote(key) {
 
 async function sendRobotCommand(command, value) {
   if (!state.robotId) return showToast("연동된 로봇이 없습니다.");
+  if (!isAdmin()) return showToast("관리자만 웹에서 주행 명령을 보낼 수 있습니다.");
   await api(`/api/robots/${encodeURIComponent(state.robotId)}/commands`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -597,6 +686,7 @@ async function sendRobotCommand(command, value) {
 }
 
 async function sendChatCommand() {
+  if (!isAdmin()) return showToast("관리자만 웹에서 명령과 대화를 전송할 수 있습니다.");
   const input = $("chatCommandInput");
   const message = input.value.trim();
   if (!message) return showToast("명령이나 질문을 입력하세요.");
@@ -683,11 +773,20 @@ function syncFullscreenLayout() {
   if (button) button.textContent = document.fullscreenElement ? "전체화면 해제" : "전체화면";
 }
 
-function clearKioskLog() {
-  state.kioskLogClearedAt = Date.now();
-  sessionStorage.setItem("onplant_kiosk_log_cleared_at", String(state.kioskLogClearedAt));
-  renderKiosk();
-  showToast("키오스크 로그를 초기화했습니다.");
+async function clearKioskLog() {
+  if (!state.robotId) return;
+  try {
+    await api(`/api/robots/${encodeURIComponent(state.robotId)}/activity`, { method: "DELETE" });
+    state.latestCommands = [];
+    state.latestMoveLogs = [];
+    state.kioskLogClearedAt = Date.now();
+    sessionStorage.setItem("onplant_kiosk_log_cleared_at", String(state.kioskLogClearedAt));
+    renderKiosk();
+    showToast("실행 로그를 초기화했습니다.");
+  } catch (error) {
+    showToast("실행 로그 초기화에 실패했습니다.");
+    console.error(error);
+  }
 }
 
 function openKioskMode() {
@@ -785,6 +884,7 @@ function bindEvents() {
     await refreshBoard();
   }));
   $("saveConfig").addEventListener("click", saveConfig);
+  $("saveAdminConfig").addEventListener("click", saveAdminConfig);
   $("sendChatCommand").addEventListener("click", sendChatCommand);
   $("chatCommandInput").addEventListener("keydown", (event) => { if (event.key === "Enter") sendChatCommand(); });
   document.querySelectorAll("[data-remote]").forEach((button) => button.addEventListener("click", () => sendRemote(button.dataset.remote)));
@@ -808,7 +908,13 @@ function bindEvents() {
   $("openKioskMode")?.addEventListener("click", openKioskMode);
   $("enterFullscreen")?.addEventListener("click", enterFullscreen);
   $("clearKioskLog")?.addEventListener("click", clearKioskLog);
+  $("speakerVolume").addEventListener("input", (event) => { $("speakerVolumeValue").textContent = `${event.target.value}%`; });
+  $("displayBrightness").addEventListener("input", (event) => { $("displayBrightnessValue").textContent = `${event.target.value}%`; });
   document.addEventListener("fullscreenchange", syncFullscreenLayout);
+  window.addEventListener("popstate", () => {
+    const view = routeViews[window.location.pathname] || "dashboard";
+    setView(view, { updateUrl: false });
+  });
 }
 
 bindEvents();
@@ -817,5 +923,7 @@ if (savedUser) {
   showApp(JSON.parse(savedUser));
   refreshAll();
 }
-setInterval(refreshSummary, 3000);
-setInterval(refreshLidar, 700);
+setInterval(() => refreshSummary().catch(() => {}), 3000);
+setInterval(() => refreshLidar().catch(() => {}), 700);
+setInterval(() => refreshMoveLogs().catch(() => {}), 1000);
+setInterval(() => refreshCommands().catch(() => {}), 1500);

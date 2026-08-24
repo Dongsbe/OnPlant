@@ -13,7 +13,6 @@ import urllib.request
 import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
-from difflib import SequenceMatcher
 from pathlib import Path
 from random import choices, uniform
 from threading import Lock
@@ -579,17 +578,40 @@ def _should_store_sensor_reading(robot_id: str, reading: StoredReading) -> bool:
         return True
 
     config = _configs.get(robot_id) or RobotConfig()
-    if reading.lux is not None:
-        if reading.lux < 250 or reading.lux >= config.excess_lux:
-            return True
-        if previous.lux is not None and abs(reading.lux - previous.lux) >= 200:
-            return True
 
-    if reading.temperature is not None and (reading.temperature < 10 or reading.temperature > 35):
+    def sensor_band(value: float | None, low: float, high: float) -> str:
+        if value is None:
+            return "missing"
+        if value < low:
+            return "low"
+        if value > high:
+            return "high"
+        return "normal"
+
+    current_bands = (
+        sensor_band(reading.lux, config.daily_lux_min, config.excess_lux),
+        sensor_band(reading.temperature, 10, 35),
+        sensor_band(reading.humidity, 20, 80),
+        sensor_band(reading.soil_moisture, 15, 80),
+    )
+    previous_bands = (
+        sensor_band(previous.lux, config.daily_lux_min, config.excess_lux),
+        sensor_band(previous.temperature, 10, 35),
+        sensor_band(previous.humidity, 20, 80),
+        sensor_band(previous.soil_moisture, 15, 80),
+    )
+    if current_bands != previous_bands:
         return True
-    if reading.humidity is not None and (reading.humidity < 20 or reading.humidity > 80):
-        return True
-    if reading.soil_moisture is not None and (reading.soil_moisture < 15 or reading.soil_moisture > 80):
+
+    # A sudden lux change is useful, but never persist it every five seconds.
+    if (
+        previous_time
+        and current_time
+        and current_time - previous_time >= timedelta(minutes=1)
+        and reading.lux is not None
+        and previous.lux is not None
+        and abs(reading.lux - previous.lux) >= 250
+    ):
         return True
 
     return False
@@ -728,16 +750,22 @@ def _normalize_speech_text(message: str) -> str:
     return message.lower().replace(" ", "").strip()
 
 
-WAKE_WORDS = ("동스비", "동스", "돈스비", "동수비", "동시비", "동쓰비", "온플랜트", "onplant", "hey동스비")
+WAKE_WORDS = (
+    "동스비",
+    "동시비",
+    "동수비",
+    "동쓰비",
+    "동스피",
+    "돈스비",
+    "온플랜트",
+    "onplant",
+    "hey동스비",
+)
 
 
 def _looks_like_wake_word(text: str) -> bool:
     normalized = _normalize_speech_text(text).strip(".,!?야아")
-    if normalized in WAKE_WORDS:
-        return True
-    if 2 <= len(normalized) <= 5 and ("동" in normalized or "돈" in normalized or "비" in normalized):
-        return max(SequenceMatcher(None, normalized, wake).ratio() for wake in WAKE_WORDS) >= 0.62
-    return False
+    return normalized in WAKE_WORDS
 
 
 def _is_wake_word_only(message: str) -> bool:
@@ -821,7 +849,8 @@ def _is_recent(value: str | None, seconds: int = 20) -> bool:
         return False
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return datetime.now(timezone.utc) - parsed <= timedelta(seconds=seconds)
+    age = datetime.now(timezone.utc) - parsed
+    return timedelta(seconds=-5) <= age <= timedelta(seconds=seconds)
 
 
 def _current_robot_motion_state(robot_id: str) -> tuple[str, bool]:
@@ -913,8 +942,12 @@ def _process_llm_chat_locked(robot_id: str, chat: LlmChatIn) -> LlmChatOut:
     _ensure_robot(robot_id)
     motion_state, is_moving = _current_robot_motion_state(robot_id)
     if _is_wake_word_only(raw_message):
+        _start_listening(robot_id, seconds=15)
+        reply = "네, 말씀하세요."
+        if chat.speak:
+            _append_command_locked(robot_id, CommandIn(command="speak", value=reply))
         _save_state()
-        return LlmChatOut(reply="", intent="nickname", listening=False)
+        return LlmChatOut(reply=reply, intent="wake", listening=True)
 
     listening = _is_listening(robot_id)
     message = _strip_wake_word(raw_message)
@@ -980,7 +1013,19 @@ def _transcribe_audio(audio_path: Path) -> str:
         compute_type = os.getenv("ONPLANT_STT_COMPUTE_TYPE", "int8")
         _stt_model_cache = WhisperModel(model_name, device=device, compute_type=compute_type)
 
-    segments, _info = _stt_model_cache.transcribe(str(audio_path), language="ko", vad_filter=True)
+    initial_prompt = os.getenv(
+        "ONPLANT_STT_PROMPT",
+        "동스비. 오늘 상태 어때. 최적 조도 찾아줘. 멈춰. 오늘 날씨 어때.",
+    )
+    segments, _info = _stt_model_cache.transcribe(
+        str(audio_path),
+        language="ko",
+        vad_filter=True,
+        beam_size=5,
+        temperature=0,
+        condition_on_previous_text=False,
+        initial_prompt=initial_prompt,
+    )
     text = " ".join(segment.text.strip() for segment in segments).strip()
     if not text:
         raise RuntimeError("STT returned empty text")
@@ -1098,8 +1143,15 @@ def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
 
 
+@app.get("/dashboard")
+@app.get("/live")
+@app.get("/sensors")
+@app.get("/logs")
+@app.get("/control")
+@app.get("/board")
+@app.get("/admin")
 @app.get("/kiosk")
-def kiosk_page() -> FileResponse:
+def app_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
 
 
@@ -1193,8 +1245,15 @@ def robot_summary(robot_id: str) -> dict[str, Any]:
     with _lock:
         _ensure_robot(robot_id)
         latest = _latest_for(robot_id)
+        last_seen = _robots[robot_id].last_seen
+        online = _is_recent(last_seen, seconds=30)
         return {
             "robot": _robots[robot_id],
+            "connection": {
+                "online": online,
+                "last_seen": last_seen,
+                "stale_after_seconds": 30,
+            },
             "latest": latest,
             "config": _configs[robot_id],
             "status": _status_from(latest, _configs[robot_id]),
@@ -1216,17 +1275,25 @@ def receive_lidar_frame(robot_id: str, frame: LidarFrameIn) -> StoredLidarFrame:
         )
         _lidar_latest[robot_id] = stored
         _robots[robot_id].last_seen = stored.received_at
-        _append_move_log_locked(
-            robot_id,
-            MoveLogIn(
-                state=frame.state,
-                action=frame.action,
-                message=("전방 위험 감지" if frame.front_blocked or frame.danger or frame.emergency else "FSM 주행 상태 갱신"),
-                target_lux=frame.best_lux,
-                current_lux=frame.current_lux,
-                source=frame.source,
-            ),
-        )
+        message = "전방 위험 감지" if frame.front_blocked or frame.danger or frame.emergency else "FSM 주행 상태 갱신"
+        previous_log = _move_logs.get(robot_id, [])[-1] if _move_logs.get(robot_id) else None
+        if (
+            previous_log is None
+            or previous_log.state != frame.state
+            or previous_log.action != frame.action
+            or previous_log.message != message
+        ):
+            _append_move_log_locked(
+                robot_id,
+                MoveLogIn(
+                    state=frame.state,
+                    action=frame.action,
+                    message=message,
+                    target_lux=frame.best_lux,
+                    current_lux=frame.current_lux,
+                    source=frame.source,
+                ),
+            )
         _save_state()
         return stored
 
@@ -1279,9 +1346,13 @@ def sensor_history(robot_id: str, limit: int = 100) -> list[StoredReading]:
 
 @app.delete("/api/robots/{robot_id}/history")
 def clear_sensor_history(robot_id: str) -> dict[str, Any]:
+    global _next_sensor_id
+
     with _lock:
         count = len(_history.get(robot_id, []))
         _history[robot_id].clear()
+        if not any(_history.values()):
+            _next_sensor_id = 1
         _save_state()
         return {"robot_id": robot_id, "cleared": count}
 
@@ -1340,6 +1411,7 @@ async def voice_chat(
     robot_id: str,
     audio: UploadFile = File(...),
     username: str = Form(default="demo"),
+    phase: str = Form(default="direct"),
 ) -> VoiceChatOut:
     suffix = Path(audio.filename or "voice.wav").suffix or ".wav"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_audio:
@@ -1358,8 +1430,40 @@ async def voice_chat(
         except OSError:
             pass
 
+    phase = phase.lower().strip()
     with _lock:
-        chat_result = _process_llm_chat_locked(robot_id, LlmChatIn(message=transcript, username=username))
+        if phase == "wake":
+            if _looks_like_wake_word(transcript):
+                _start_listening(robot_id, seconds=15)
+                chat_result = LlmChatOut(
+                    reply="네, 말씀하세요.",
+                    intent="wake",
+                    listening=True,
+                )
+            else:
+                chat_result = LlmChatOut(
+                    reply="",
+                    intent="ignored",
+                    listening=False,
+                )
+        elif phase == "command":
+            if not _is_listening(robot_id):
+                chat_result = LlmChatOut(
+                    reply="",
+                    intent="ignored",
+                    listening=False,
+                )
+            else:
+                chat_result = _process_llm_chat_locked(
+                    robot_id,
+                    LlmChatIn(message=transcript, username=username),
+                )
+                _llm_listen_until.pop(robot_id, None)
+        else:
+            chat_result = _process_llm_chat_locked(
+                robot_id,
+                LlmChatIn(message=transcript, username=username),
+            )
 
     audio_url = None
     try:
@@ -1458,6 +1562,22 @@ def create_move_log(robot_id: str, log: MoveLogIn) -> StoredMoveLog:
         stored = _append_move_log_locked(robot_id, log)
         _save_state()
         return stored
+
+
+@app.delete("/api/robots/{robot_id}/activity")
+def clear_robot_activity(robot_id: str) -> dict[str, Any]:
+    with _lock:
+        _ensure_robot(robot_id)
+        move_count = len(_move_logs.get(robot_id, []))
+        command_count = len(_commands.get(robot_id, []))
+        _move_logs[robot_id].clear()
+        _commands[robot_id].clear()
+        _save_state()
+        return {
+            "robot_id": robot_id,
+            "cleared_move_logs": move_count,
+            "cleared_commands": command_count,
+        }
 
 
 @app.get("/api/robots/{robot_id}/display", response_model=DisplayState)
