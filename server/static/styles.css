@@ -1132,7 +1132,7 @@ label > select {
   min-height: 760px;
   margin: 0 auto;
   display: grid;
-  grid-template-rows: minmax(260px, 0.3fr) minmax(180px, 0.22fr) minmax(320px, 0.48fr);
+  grid-template-rows: max-content minmax(240px, 0.35fr) minmax(420px, 0.65fr);
   gap: 14px;
 }
 
@@ -1146,8 +1146,8 @@ label > select {
 
 .kiosk-status {
   min-height: 0;
-  flex: 1;
-  overflow: auto;
+  flex: 0 0 auto;
+  overflow: visible;
   border-left: 4px solid var(--green);
   background: #f6faf6;
   color: var(--ink);
@@ -1181,7 +1181,7 @@ label > select {
 #kioskLidarCanvas {
   flex: 1;
   height: auto;
-  min-height: 360px;
+  min-height: 420px;
 }
 
 .kiosk-fullscreen .app {

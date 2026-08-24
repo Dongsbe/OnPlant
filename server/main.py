@@ -600,7 +600,14 @@ def _should_store_sensor_reading(robot_id: str, reading: StoredReading) -> bool:
         sensor_band(previous.humidity, 20, 80),
         sensor_band(previous.soil_moisture, 15, 80),
     )
-    if current_bands != previous_bands:
+    # Keep live updates at five seconds, but rate-limit persisted transitions so
+    # values oscillating around a threshold cannot flood the history table.
+    if (
+        current_bands != previous_bands
+        and previous_time
+        and current_time
+        and current_time - previous_time >= timedelta(minutes=1)
+    ):
         return True
 
     # A sudden lux change is useful, but never persist it every five seconds.
@@ -753,13 +760,12 @@ def _normalize_speech_text(message: str) -> str:
 WAKE_WORDS = (
     "동스비",
     "동시비",
+    "동습이",
+    "동습비",
     "동수비",
     "동쓰비",
     "동스피",
     "돈스비",
-    "온플랜트",
-    "onplant",
-    "hey동스비",
 )
 
 

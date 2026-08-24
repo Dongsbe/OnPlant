@@ -177,7 +177,7 @@ async function refreshSummary() {
   renderPlantAvatar(robot.plant_avatar);
   $("statusPill").textContent = online ? status.level : "오프라인";
   $("statusPill").className = `status-pill ${online ? status.tone : "offline"}`;
-  $("statusPill").classList.toggle("hidden", !online);
+  $("statusPill").classList.remove("hidden");
   $("statusEmoji").textContent = status.emoji;
   $("statusLevel").textContent = online ? status.level : "오프라인";
   $("statusMessage").textContent = online ? status.message : "라즈봇에서 최근 센서 데이터가 들어오지 않았습니다.";
