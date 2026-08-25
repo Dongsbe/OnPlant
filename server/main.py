@@ -23,9 +23,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 
 
 BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+import database
+
 STATIC_DIR = BASE_DIR / "static"
 DATA_PATH = Path(os.getenv("ONPLANT_DATA", BASE_DIR / "onplant_state.json"))
 VOICE_DIR = BASE_DIR / "voice_outputs"
@@ -395,17 +400,16 @@ def _serialize_state() -> dict[str, Any]:
 
 
 def _save_state() -> None:
-    DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
-    DATA_PATH.write_text(
-        json.dumps(_serialize_state(), ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    database.save_state(_serialize_state())
 
 
 def _load_state() -> None:
     global _next_sensor_id, _next_command_id, _next_post_id, _next_move_log_id
 
-    if not DATA_PATH.exists():
+    database.initialize_database()
+    database.migrate_json_once(DATA_PATH)
+    data = database.load_state()
+    if data is None:
         _default_robot()
         _board_posts.extend(
             [
@@ -431,7 +435,6 @@ def _load_state() -> None:
         _save_state()
         return
 
-    data = json.loads(DATA_PATH.read_text(encoding="utf-8"))
     _next_sensor_id = int(data.get("next_sensor_id", 1))
     _next_command_id = int(data.get("next_command_id", 1))
     _next_post_id = int(data.get("next_post_id", 1))
@@ -1612,7 +1615,7 @@ def remote_button(robot_id: str, remote: RemoteIn) -> DisplayState:
         current.updated_at = _now_iso()
         _display_states[robot_id] = current
         response = _display_state_for_response(robot_id, current)
-        _commands[robot_id].append(StoredCommand(id=0, robot_id=robot_id, command=f"remote-{remote.key}", value=response.screen, created_at=current.updated_at))
+        _append_command_locked(robot_id, CommandIn(command=f"remote-{remote.key}", value=response.screen))
         _save_state()
         return response
 
